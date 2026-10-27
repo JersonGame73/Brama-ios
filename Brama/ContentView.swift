@@ -87,11 +87,7 @@ struct ContentView: View {
                 performanceHUDOverlay
             }
             
-            // Virtual Gamepad Overlay (if enabled)
-            if controllerManager.showVirtualTouchControls {
-                VirtualGamepadOverlayView()
-                    .transition(.opacity)
-            }
+
             
             // Quick Access Sidebar ("..." Button Menu)
             if showQuickAccessMenu {
@@ -237,20 +233,7 @@ struct ContentView: View {
             .background(Color.white.opacity(0.08))
             .cornerRadius(16)
             
-            // Touch Controls Button
-            Button(action: {
-                withAnimation {
-                    controllerManager.showVirtualTouchControls.toggle()
-                }
-            }) {
-                Image(systemName: controllerManager.showVirtualTouchControls ? "hand.tap.fill" : "hand.tap")
-                    .font(.system(size: 14, weight: .bold))
-                    .foregroundColor(controllerManager.showVirtualTouchControls ? Color(red: 0.1, green: 0.62, blue: 1.0) : .white.opacity(0.8))
-                    .frame(width: 34, height: 34)
-                    .background(Color.white.opacity(0.08))
-                    .clipShape(Circle())
-            }
-            
+
             // Quick Access ("...") Button
             Button(action: {
                 withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {

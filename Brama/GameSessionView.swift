@@ -285,6 +285,23 @@ struct GameSessionView: View {
                 }
                 
                 Button(action: {
+                    withAnimation {
+                        controllerManager.showVirtualTouchControls.toggle()
+                    }
+                }) {
+                    HStack {
+                        Image(systemName: controllerManager.showVirtualTouchControls ? "hand.tap.fill" : "hand.tap")
+                        Text(controllerManager.showVirtualTouchControls ? "Ocultar Mando Táctil" : "Mostrar Mando Táctil")
+                    }
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(.white.opacity(0.9))
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 11)
+                    .background(Color.white.opacity(0.08))
+                    .cornerRadius(10)
+                }
+                
+                Button(action: {
                     dismiss()
                 }) {
                     HStack {
@@ -350,31 +367,35 @@ struct GameSessionView: View {
     private func startBootSequence() {
         bootLogs.removeAll()
         
-        let steps: [(String, Double)] = [
-            ("[BRAMA] Initializing Apple Silicon Metal GPU viewport...", 0.1),
-            ("[BRAMA] Target resolution: \(game.screenResolution) • Scaling: \(game.scalingMode)", 0.3),
-            ("[JIT] Checking dynamic code generation entitlements...", 0.6),
-            ("[JIT] Memory page RWX allocation: GRANTED (Active JIT)", 0.9),
-            ("[WINE] Mounting sandboxed prefix ~/Documents/WinePrefixes/\(game.winePrefixName)...", 1.2),
-            ("[WINE] Mapping drive_c to local iOS sandbox.", 1.5),
-            ("[CPU] Loading translation engine: \(game.translationEngine.rawValue)", 1.8),
-            ("[GRAPHICS] Loading \(game.graphicsBackend.rawValue) translation pipeline...", 2.2),
-            ("[DXMT] Creating Metal device context and render command buffer...", 2.5),
-            ("[EXEC] Spawning Windows PE binary: \(game.executablePath)", 2.8),
-            ("[EXEC] Passing arguments: \(game.launchArguments.isEmpty ? "(none)" : game.launchArguments)", 3.1),
-            ("[BRAMA] Render loop successfully attached. Handheld controls ready.", 3.5)
-        ]
+        let prefixURL = GameStorageManager.shared.winePrefixesDirectory
+            .appendingPathComponent(game.winePrefixName)
+            .path
         
-        for (log, delay) in steps {
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+        // 1. Invoke native C++ BramaCore
+        bootLogs.append("[BRAMA] Initializing Apple Silicon Metal GPU viewport...")
+        bootLogs.append("[BRAMA] Target resolution: \(game.screenResolution) • Scaling: \(game.scalingMode)")
+        
+        let jitAvailable = BramaCore.shared().isJITAvailable()
+        perfManager.isJITEnabled = jitAvailable
+        bootLogs.append("[JIT] Dynamic code generation: \(jitAvailable ? "GRANTED (Active JIT)" : "RESTRICTED (Interpreter)")")
+        
+        _ = BramaCore.shared().launchExecutable(
+            atPath: game.executablePath,
+            prefixPath: prefixURL,
+            arguments: game.launchArguments
+        ) { log in
+            DispatchQueue.main.async {
                 self.bootLogs.append(log)
-                if delay >= 3.5 {
-                    self.isBootSequenceFinished = true
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
-                        withAnimation {
-                            self.showBootConsole = false
-                        }
-                    }
+            }
+        }
+        
+        // 2. Transition to active game render canvas
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+            self.bootLogs.append("[BRAMA] Render loop successfully attached. Handheld controls ready.")
+            self.isBootSequenceFinished = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
+                withAnimation {
+                    self.showBootConsole = false
                 }
             }
         }
