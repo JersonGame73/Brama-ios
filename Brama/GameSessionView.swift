@@ -29,8 +29,9 @@ struct GameSessionView: View {
                 .ignoresSafeArea()
             
             // Native Metal GPU Viewport (Swapchain target for DXMT / MoltenVK)
-            MetalViewportView()
+            MetalViewportView(targetFPSLimit: perfManager.targetFPSLimit)
                 .ignoresSafeArea()
+                .allowsHitTesting(false)
             
             // In-Game Boot Terminal / Wine & PE32+ Loader Console
             if showBootConsole {

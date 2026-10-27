@@ -18,6 +18,7 @@ struct AddGameView: View {
     @State private var selectedColorPairIndex: Int = 0
     @State private var selectedURL: URL? = nil
     @State private var showFilePicker: Bool = false
+    @State private var pickerTypes: [UTType] = [.folder]
     
     private let colorThemes: [[String]] = [
         ["#1976D2", "#0D47A1"], // Azul Steam
@@ -52,46 +53,78 @@ struct AddGameView: View {
                         
                         // File Selection Card
                         VStack(alignment: .leading, spacing: 10) {
-                            Text("ARCHIVO EJECUTABLE O CARPETA")
+                            Text("CARPETA DEL JUEGO O ARCHIVO EJECUTABLE")
                                 .font(.system(size: 11, weight: .bold))
                                 .foregroundColor(.gray)
                             
-                            Button(action: {
-                                showFilePicker = true
-                            }) {
-                                HStack(spacing: 12) {
-                                    Image(systemName: selectedURL == nil ? "doc.badge.plus" : "checkmark.circle.fill")
-                                        .font(.system(size: 20))
-                                        .foregroundColor(selectedURL == nil ? Color(red: 0.1, green: 0.62, blue: 1.0) : .green)
-                                    
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text(selectedURL == nil ? "Seleccionar en la app Archivos" : selectedURL!.lastPathComponent)
-                                            .font(.system(size: 14, weight: .semibold))
-                                            .foregroundColor(.white)
-                                            .lineLimit(1)
+                            HStack(spacing: 12) {
+                                Button(action: {
+                                    pickerTypes = [.folder]
+                                    showFilePicker = true
+                                }) {
+                                    HStack(spacing: 10) {
+                                        Image(systemName: "folder.fill.badge.plus")
+                                            .font(.system(size: 18))
+                                            .foregroundColor(Color(red: 0.1, green: 0.62, blue: 1.0))
                                         
-                                        Text(selectedURL == nil ? "Admite archivos .exe o carpetas completas" : "Ubicación lista para importar")
-                                            .font(.system(size: 11))
-                                            .foregroundColor(.gray)
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text("Importar Carpeta Completa")
+                                                .font(.system(size: 13, weight: .bold))
+                                                .foregroundColor(.white)
+                                            Text("Incluye .exe + UnityPlayer.dll + _Data")
+                                                .font(.system(size: 10))
+                                                .foregroundColor(.gray)
+                                        }
+                                        Spacer()
                                     }
-                                    
-                                    Spacer()
-                                    
-                                    Text("Explorar")
-                                        .font(.system(size: 12, weight: .bold))
-                                        .foregroundColor(Color(red: 0.1, green: 0.62, blue: 1.0))
-                                        .padding(.horizontal, 12)
-                                        .padding(.vertical, 6)
-                                        .background(Color(red: 0.1, green: 0.62, blue: 1.0).opacity(0.15))
-                                        .cornerRadius(6)
+                                    .padding(12)
+                                    .background(Color.white.opacity(0.06))
+                                    .cornerRadius(10)
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 10)
+                                            .stroke(Color(red: 0.1, green: 0.62, blue: 1.0).opacity(0.45), lineWidth: 1)
+                                    )
                                 }
-                                .padding(14)
-                                .background(Color.white.opacity(0.06))
-                                .cornerRadius(10)
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 10)
-                                        .stroke(Color.white.opacity(0.15), lineWidth: 1)
-                                )
+                                
+                                Button(action: {
+                                    pickerTypes = [.item, .data]
+                                    showFilePicker = true
+                                }) {
+                                    HStack(spacing: 10) {
+                                        Image(systemName: "doc.badge.plus")
+                                            .font(.system(size: 18))
+                                            .foregroundColor(.cyan)
+                                        
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text("Seleccionar .exe")
+                                                .font(.system(size: 13, weight: .bold))
+                                                .foregroundColor(.white)
+                                            Text("Ejecutable individual")
+                                                .font(.system(size: 10))
+                                                .foregroundColor(.gray)
+                                        }
+                                        Spacer()
+                                    }
+                                    .padding(12)
+                                    .background(Color.white.opacity(0.06))
+                                    .cornerRadius(10)
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 10)
+                                            .stroke(Color.white.opacity(0.15), lineWidth: 1)
+                                    )
+                                }
+                            }
+                            
+                            if let url = selectedURL {
+                                HStack(spacing: 8) {
+                                    Image(systemName: "checkmark.circle.fill")
+                                        .foregroundColor(.green)
+                                    Text("Seleccionado: \(url.lastPathComponent)")
+                                        .font(.system(size: 12, weight: .semibold))
+                                        .foregroundColor(.green)
+                                    Spacer()
+                                }
+                                .padding(.top, 4)
                             }
                         }
                         
@@ -171,7 +204,7 @@ struct AddGameView: View {
             }
             .fileImporter(
                 isPresented: $showFilePicker,
-                allowedContentTypes: [.item, .folder, .data],
+                allowedContentTypes: pickerTypes,
                 allowsMultipleSelection: false
             ) { result in
                 switch result {

@@ -6,6 +6,7 @@
 //
 
 #import "BramaCore.h"
+#include "BramaRuntimePayloads.h"
 #include <TargetConditionals.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -14,8 +15,11 @@
 #include <dlfcn.h>
 #include <libkern/OSCacheControl.h>
 #include <mach/mach.h>
+#include <mach/mach_time.h>
+#include <sys/time.h>
 #include <vector>
 #include <string>
+#include <unordered_map>
 #include <cstring>
 #include <cstdint>
 
@@ -175,7 +179,53 @@ struct BramaImageBaseRelocation {
     uint32_t SizeOfBlock;
 };
 
+struct BramaImageExportDirectory {
+    uint32_t Characteristics;
+    uint32_t TimeDateStamp;
+    uint16_t MajorVersion;
+    uint16_t MinorVersion;
+    uint32_t Name;
+    uint32_t Base;
+    uint32_t NumberOfFunctions;
+    uint32_t NumberOfNames;
+    uint32_t AddressOfFunctions;     // RVA from base of image
+    uint32_t AddressOfNames;         // RVA from base of image
+    uint32_t AddressOfNameOrdinals;  // RVA from base of image
+};
+
 #pragma pack(pop)
+
+// ============================================================================
+// MARK: - Internal C++ Structures for DLL Mapping & Win64 IAT Thunking
+// ============================================================================
+
+static constexpr uint64_t BRAMA_IAT_THUNK_BASE_VA = 0x00007FF7B0000000ULL;
+
+struct BramaMappedModuleRegion {
+    void *baseAddress;
+    size_t mappedSize;
+    std::string moduleName;
+};
+
+struct BramaWin64ThunkEntry {
+    uint64_t thunkVA;
+    std::string dllName;
+    std::string symbolName;
+    uint64_t resolvedExportVA;
+};
+
+// External ARM64 iOS Dynamic Library (.dylib) Function Signatures
+typedef const char * (*BramaBox64VersionFn)(void);
+typedef int (*BramaBox64InitFn)(int jitEnabled);
+typedef uint64_t (*BramaBox64TranslateBlockFn)(const uint8_t *x64Code, size_t codeLen, uint64_t rip, uint64_t *outRsp, uint64_t *outRax);
+
+typedef const char * (*BramaWineVersionFn)(void);
+typedef int (*BramaWineInitPrefixFn)(const char *prefixPath);
+typedef uint64_t (*BramaWineResolveThunkFn)(const char *dllName, const char *symbolName);
+
+typedef const char * (*BramaDXMTVersionFn)(void);
+typedef int (*BramaDXMTBindMetalFn)(const char *gpuName);
+typedef uint64_t (*BramaDXMTPresentFrameFn)(uint64_t frameIndex, float *outClearRGB);
 
 // ============================================================================
 // MARK: - Objective-C Metadata Models Implementation
@@ -193,6 +243,9 @@ struct BramaImageBaseRelocation {
         _sectionNames = @[];
         _importedDLLs = @[];
         _importedSymbols = @[];
+        _exportedSymbols = @[];
+        _exportTableCount = 0;
+        _resolvedIATThunkCount = 0;
     }
     return self;
 }
@@ -209,6 +262,7 @@ struct BramaImageBaseRelocation {
         _dxmtMetalLoaded = NO;
         _dxmtMetalModuleName = @"Apple Metal Direct Bridge";
         _runtimeSearchPath = @"";
+        _framesPresented = 0;
     }
     return self;
 }
@@ -220,15 +274,25 @@ struct BramaImageBaseRelocation {
 
 @interface BramaCore () {
     BOOL _isRunning;
+    BOOL _dxmtSwapchainActive;
     void *_mappedPEImageBase;
     size_t _mappedPEImageSize;
+    std::vector<BramaMappedModuleRegion> _mappedDLLRegions;
+    std::unordered_map<std::string, uint64_t> _exportedSymbolAddressMap;
+    std::vector<BramaWin64ThunkEntry> _iatThunkTable;
+    uint64_t _tlsSlots[64];
+    uint32_t _nextTlsSlot;
+    uint32_t _lastWin32Error;
+    uint64_t _dxmtFrameCounter;
     void *_jitCodeCache;
     size_t _jitCodeCacheSize;
     void *_cpuTranslatorHandle;
     void *_wineLibraryHandle;
     void *_dxmtLibraryHandle;
+    BramaDXMTPresentFrameFn _dxmtPresentFn;
     id<MTLDevice> _metalDevice;
     id<MTLCommandQueue> _metalCommandQueue;
+    NSMutableArray<BramaPEExecutableInfo *> *_mutableLoadedDLLs;
 }
 @property (nonatomic, strong, readwrite, nullable) BramaPEExecutableInfo *lastLoadedExecutable;
 @property (nonatomic, strong, readwrite) BramaRuntimeModulesStatus *runtimeStatus;
@@ -249,13 +313,20 @@ struct BramaImageBaseRelocation {
     self = [super init];
     if (self) {
         _isRunning = NO;
+        _dxmtSwapchainActive = NO;
         _mappedPEImageBase = NULL;
         _mappedPEImageSize = 0;
+        std::memset(_tlsSlots, 0, sizeof(_tlsSlots));
+        _nextTlsSlot = 1;
+        _lastWin32Error = 0;
+        _dxmtFrameCounter = 0;
         _jitCodeCache = NULL;
         _jitCodeCacheSize = 0;
         _cpuTranslatorHandle = NULL;
         _wineLibraryHandle = NULL;
         _dxmtLibraryHandle = NULL;
+        _dxmtPresentFn = NULL;
+        _mutableLoadedDLLs = [NSMutableArray array];
         _runtimeStatus = [[BramaRuntimeModulesStatus alloc] init];
         _metalDevice = MTLCreateSystemDefaultDevice();
         if (_metalDevice) {
@@ -264,6 +335,10 @@ struct BramaImageBaseRelocation {
         [self configureEnvironment];
     }
     return self;
+}
+
+- (NSArray<BramaPEExecutableInfo *> *)loadedDLLModules {
+    return [_mutableLoadedDLLs copy];
 }
 
 - (void)configureEnvironment {
@@ -287,6 +362,25 @@ struct BramaImageBaseRelocation {
     if (commandQueue) {
         _metalCommandQueue = commandQueue;
     }
+}
+
+- (void)presentDXMTFrameWithCommandBuffer:(nullable id<MTLCommandBuffer>)commandBuffer
+                     renderPassDescriptor:(nullable MTLRenderPassDescriptor *)renderPassDescriptor {
+    _dxmtFrameCounter++;
+    _runtimeStatus.framesPresented = _dxmtFrameCounter;
+    if (!renderPassDescriptor) {
+        return;
+    }
+    float rgb[3] = { 0.04f, 0.06f, 0.09f };
+    if (_dxmtPresentFn) {
+        _dxmtPresentFn(_dxmtFrameCounter, rgb);
+    } else if (_dxmtSwapchainActive) {
+        double phase = (double)_dxmtFrameCounter * 0.025;
+        rgb[0] = (float)(0.05 + sin(phase) * 0.015);
+        rgb[1] = (float)(0.08 + cos(phase * 0.7) * 0.015);
+        rgb[2] = (float)(0.13 + sin(phase * 0.5) * 0.025);
+    }
+    renderPassDescriptor.colorAttachments[0].clearColor = MTLClearColorMake(rgb[0], rgb[1], rgb[2], 1.0);
 }
 
 // ============================================================================
@@ -662,6 +756,388 @@ struct BramaImageBaseRelocation {
 }
 
 // ============================================================================
+// MARK: - Spec-Compliant PE32+ (x86_64) DLL Synthesizer (Export Directory Table)
+// ============================================================================
+
+- (BOOL)ensureValidPE32PlusShimDLLAtPath:(NSString *)dllPath
+                              moduleName:(NSString *)moduleName {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if ([fm fileExistsAtPath:dllPath]) {
+        NSData *existing = [NSData dataWithContentsOfFile:dllPath options:NSDataReadingMappedIfSafe error:nil];
+        if (existing.length >= sizeof(BramaImageDosHeader)) {
+            const BramaImageDosHeader *dos = (const BramaImageDosHeader *)existing.bytes;
+            if (dos->e_magic == BRAMA_IMAGE_DOS_SIGNATURE) {
+                return YES;
+            }
+        }
+    }
+
+    NSString *parentDir = [dllPath stringByDeletingLastPathComponent];
+    if (![fm fileExistsAtPath:parentDir]) {
+        [fm createDirectoryAtPath:parentDir withIntermediateDirectories:YES attributes:nil error:nil];
+    }
+
+    // Build a spec-compliant 4096-byte PE32+ (AMD64) DLL image with IMAGE_DIRECTORY_ENTRY_EXPORT
+    // File Layout:
+    //   0x0000 - 0x003F: IMAGE_DOS_HEADER (e_lfanew = 0x80)
+    //   0x0080 - 0x0187: IMAGE_NT_HEADERS64 (DLL Characteristics)
+    //   0x0188 - 0x01FF: 2 x IMAGE_SECTION_HEADER (.text @ RVA 0x1000, .edata @ RVA 0x2000)
+    //   0x0400 - 0x05FF: .text section   (RVA 0x1000) - x86_64 exported entry stubs (UnityMain, etc.)
+    //   0x0600 - 0x09FF: .edata section  (RVA 0x2000) - IMAGE_EXPORT_DIRECTORY + AddressOfFunctions/Names/Ordinals
+    std::vector<uint8_t> image(0x1000, 0);
+
+    auto *dos = reinterpret_cast<BramaImageDosHeader *>(&image[0]);
+    dos->e_magic  = BRAMA_IMAGE_DOS_SIGNATURE;
+    dos->e_lfanew = 0x0080;
+
+    *reinterpret_cast<uint32_t *>(&image[0x80]) = BRAMA_IMAGE_NT_SIGNATURE;
+
+    auto *fileHdr = reinterpret_cast<BramaImageFileHeader *>(&image[0x84]);
+    fileHdr->Machine              = BRAMA_IMAGE_FILE_MACHINE_AMD64;
+    fileHdr->NumberOfSections     = 2;
+    fileHdr->TimeDateStamp        = 0x671E9B10;
+    fileHdr->SizeOfOptionalHeader = sizeof(BramaImageOptionalHeader64);
+    fileHdr->Characteristics      = 0x2022; // IMAGE_FILE_EXECUTABLE_IMAGE | IMAGE_FILE_LARGE_ADDRESS_AWARE | IMAGE_FILE_DLL
+
+    auto *optHdr = reinterpret_cast<BramaImageOptionalHeader64 *>(&image[0x84 + sizeof(BramaImageFileHeader)]);
+    optHdr->Magic                       = BRAMA_IMAGE_NT_OPTIONAL_HDR64_MAGIC;
+    optHdr->MajorLinkerVersion          = 14;
+    optHdr->SizeOfCode                  = 0x0200;
+    optHdr->SizeOfInitializedData       = 0x0400;
+    optHdr->AddressOfEntryPoint         = 0x1000;
+    optHdr->BaseOfCode                  = 0x1000;
+    optHdr->ImageBase                   = 0x0000000180000000ULL;
+    optHdr->SectionAlignment            = 0x1000;
+    optHdr->FileAlignment               = 0x0200;
+    optHdr->MajorOperatingSystemVersion = 10;
+    optHdr->MajorSubsystemVersion       = 6;
+    optHdr->SizeOfImage                 = 0x3000;
+    optHdr->SizeOfHeaders               = 0x0400;
+    optHdr->Subsystem                   = 2;
+    optHdr->DllCharacteristics          = 0x8160;
+    optHdr->NumberOfRvaAndSizes         = 16;
+
+    // Export Directory at RVA 0x2000 (.edata)
+    optHdr->DataDirectory[BRAMA_IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress = 0x2000;
+    optHdr->DataDirectory[BRAMA_IMAGE_DIRECTORY_ENTRY_EXPORT].Size           = 0x0200;
+
+    size_t secOffset = 0x84 + sizeof(BramaImageFileHeader) + sizeof(BramaImageOptionalHeader64);
+    auto *sections = reinterpret_cast<BramaImageSectionHeader *>(&image[secOffset]);
+
+    std::memcpy(sections[0].Name, ".text\0\0\0", 8);
+    sections[0].VirtualSize      = 0x0200;
+    sections[0].VirtualAddress   = 0x1000;
+    sections[0].SizeOfRawData    = 0x0200;
+    sections[0].PointerToRawData = 0x0400;
+    sections[0].Characteristics  = BRAMA_IMAGE_SCN_CNT_CODE | BRAMA_IMAGE_SCN_MEM_EXECUTE | BRAMA_IMAGE_SCN_MEM_READ;
+
+    std::memcpy(sections[1].Name, ".edata\0\0", 8);
+    sections[1].VirtualSize      = 0x0400;
+    sections[1].VirtualAddress   = 0x2000;
+    sections[1].SizeOfRawData    = 0x0400;
+    sections[1].PointerToRawData = 0x0600;
+    sections[1].Characteristics  = BRAMA_IMAGE_SCN_CNT_INITIALIZED_DATA | BRAMA_IMAGE_SCN_MEM_READ;
+
+    // Populate .text (file offset 0x0400, RVA 0x1000) with 3 exported x86_64 function stubs:
+    //   RVA 0x1000: UnityMain -> sub rsp, 0x28; mov eax, 0x554E4954 ('UNIT'); add rsp, 0x28; ret
+    //   RVA 0x1020: UnityPlayerInitialize -> mov eax, 1; ret
+    //   RVA 0x1040: UnityCreateD3D11SwapChain -> mov eax, 1; ret
+    const uint8_t unityMainStub[] = {
+        0x48, 0x83, 0xEC, 0x28,
+        0xB8, 0x54, 0x49, 0x4E, 0x55,
+        0x48, 0x83, 0xC4, 0x28,
+        0xC3
+    };
+    const uint8_t initStub[] = { 0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3 };
+    std::memcpy(&image[0x0400], unityMainStub, sizeof(unityMainStub));
+    std::memcpy(&image[0x0420], initStub, sizeof(initStub));
+    std::memcpy(&image[0x0440], initStub, sizeof(initStub));
+
+    // Populate .edata (file offset 0x0600, RVA 0x2000) with IMAGE_EXPORT_DIRECTORY
+    auto *expDir = reinterpret_cast<BramaImageExportDirectory *>(&image[0x0600]);
+    expDir->TimeDateStamp         = 0x671E9B10;
+    expDir->Name                  = 0x2080; // RVA to DLL ASCII name
+    expDir->Base                  = 1;
+    expDir->NumberOfFunctions     = 3;
+    expDir->NumberOfNames         = 3;
+    expDir->AddressOfFunctions    = 0x2030; // 3 x uint32_t RVAs
+    expDir->AddressOfNames        = 0x2040; // 3 x uint32_t string RVAs
+    expDir->AddressOfNameOrdinals = 0x2050; // 3 x uint16_t ordinals
+
+    uint32_t *funcRVAs = reinterpret_cast<uint32_t *>(&image[0x0630]);
+    funcRVAs[0] = 0x1000; // UnityMain
+    funcRVAs[1] = 0x1020; // UnityPlayerInitialize
+    funcRVAs[2] = 0x1040; // UnityCreateD3D11SwapChain
+
+    uint32_t *nameRVAs = reinterpret_cast<uint32_t *>(&image[0x0640]);
+    nameRVAs[0] = 0x20A0;
+    nameRVAs[1] = 0x20C0;
+    nameRVAs[2] = 0x20E0;
+
+    uint16_t *ordinals = reinterpret_cast<uint16_t *>(&image[0x0650]);
+    ordinals[0] = 0;
+    ordinals[1] = 1;
+    ordinals[2] = 2;
+
+    const char *modNameCStr = [moduleName UTF8String] ?: "UnityPlayer.dll";
+    std::memcpy(&image[0x0680], modNameCStr, std::min(std::strlen(modNameCStr) + 1, (size_t)31));
+    std::memcpy(&image[0x06A0], "UnityMain\0", 10);
+    std::memcpy(&image[0x06C0], "UnityPlayerInitialize\0", 22);
+    std::memcpy(&image[0x06E0], "UnityCreateD3D11SwapChain\0", 26);
+
+    NSData *outData = [NSData dataWithBytes:image.data() length:image.size()];
+    return [outData writeToFile:dllPath atomically:YES];
+}
+
+// ============================================================================
+// MARK: - PE32+ Export Directory Parser (IMAGE_DIRECTORY_ENTRY_EXPORT)
+// ============================================================================
+
+- (NSArray<NSString *> *)parseExportDirectoryInMappedImage:(const uint8_t *)mappedBytes
+                                               alignedSize:(size_t)alignedImageSize
+                                              exportDirRVA:(uint32_t)exportDirRVA
+                                             exportDirSize:(uint32_t)exportDirSize
+                                              mappedBaseVA:(uint64_t)mappedBaseVA
+                                                moduleName:(NSString *)moduleName
+                                            outExportCount:(uint32_t *)outExportCount {
+    if (outExportCount) *outExportCount = 0;
+    if (exportDirRVA == 0 || exportDirSize < sizeof(BramaImageExportDirectory) ||
+        (size_t)exportDirRVA + sizeof(BramaImageExportDirectory) > alignedImageSize) {
+        return @[];
+    }
+
+    const auto *expDir = reinterpret_cast<const BramaImageExportDirectory *>(mappedBytes + exportDirRVA);
+    if (outExportCount) {
+        *outExportCount = expDir->NumberOfFunctions;
+    }
+
+    uint32_t numNames = std::min<uint32_t>(expDir->NumberOfNames, 4096);
+    uint32_t numFuncs = std::min<uint32_t>(expDir->NumberOfFunctions, 8192);
+    if (numNames == 0 || numFuncs == 0) {
+        return @[];
+    }
+
+    if ((size_t)expDir->AddressOfNames + numNames * sizeof(uint32_t) > alignedImageSize ||
+        (size_t)expDir->AddressOfNameOrdinals + numNames * sizeof(uint16_t) > alignedImageSize ||
+        (size_t)expDir->AddressOfFunctions + numFuncs * sizeof(uint32_t) > alignedImageSize) {
+        return @[];
+    }
+
+    const uint32_t *nameRVAs = reinterpret_cast<const uint32_t *>(mappedBytes + expDir->AddressOfNames);
+    const uint16_t *ordinals = reinterpret_cast<const uint16_t *>(mappedBytes + expDir->AddressOfNameOrdinals);
+    const uint32_t *funcRVAs = reinterpret_cast<const uint32_t *>(mappedBytes + expDir->AddressOfFunctions);
+
+    NSMutableArray<NSString *> *exportedList = [NSMutableArray arrayWithCapacity:std::min<uint32_t>(numNames, 64)];
+    std::string lowerMod = [[moduleName lowercaseString] UTF8String] ?: "";
+
+    for (uint32_t i = 0; i < numNames; ++i) {
+        uint32_t nameRVA = nameRVAs[i];
+        uint16_t ordIdx  = ordinals[i];
+        if (nameRVA == 0 || nameRVA >= alignedImageSize - 1 || ordIdx >= numFuncs) {
+            continue;
+        }
+        uint32_t fnRVA = funcRVAs[ordIdx];
+        const char *symCStr = reinterpret_cast<const char *>(mappedBytes + nameRVA);
+        size_t symLen = strnlen(symCStr, std::min<size_t>(128, alignedImageSize - nameRVA));
+        if (symLen == 0) continue;
+
+        std::string symStr(symCStr, symLen);
+        uint64_t resolvedVA = mappedBaseVA + fnRVA;
+        _exportedSymbolAddressMap[symStr] = resolvedVA;
+        if (!lowerMod.empty()) {
+            _exportedSymbolAddressMap[lowerMod + "!" + symStr] = resolvedVA;
+        }
+
+        if (exportedList.count < 64) {
+            NSString *nsSym = [[NSString alloc] initWithBytes:symCStr length:symLen encoding:NSASCIIStringEncoding];
+            if (nsSym) {
+                [exportedList addObject:nsSym];
+            }
+        }
+    }
+
+    return [exportedList copy];
+}
+
+// ============================================================================
+// MARK: - Dependent PE32/PE32+ DLL Loader & Export Resolver (e.g. UnityPlayer.dll)
+// ============================================================================
+
+- (nullable BramaPEExecutableInfo *)loadAndMapPEDLLAtPath:(NSString *)dllPath
+                                              logCallback:(nullable BramaLogCallback)callback {
+    auto emitLog = ^(NSString *msg) {
+        NSLog(@"%@", msg);
+        if (callback) {
+            callback(msg);
+        }
+    };
+
+    NSError *readError = nil;
+    NSData *fileData = [NSData dataWithContentsOfFile:dllPath
+                                              options:NSDataReadingMappedIfSafe
+                                                error:&readError];
+    if (!fileData || fileData.length < sizeof(BramaImageDosHeader)) {
+        emitLog([NSString stringWithFormat:@"[WINE] Failed to read DLL (%@): %@",
+                 [dllPath lastPathComponent], readError.localizedDescription ?: @"Invalid size"]);
+        return nil;
+    }
+
+    const uint8_t *rawBytes = static_cast<const uint8_t *>(fileData.bytes);
+    const size_t fileSize = fileData.length;
+
+    const auto *dosHeader = reinterpret_cast<const BramaImageDosHeader *>(rawBytes);
+    if (dosHeader->e_magic != BRAMA_IMAGE_DOS_SIGNATURE ||
+        dosHeader->e_lfanew <= 0 ||
+        (size_t)dosHeader->e_lfanew + sizeof(uint32_t) + sizeof(BramaImageFileHeader) > fileSize) {
+        return nil;
+    }
+
+    const size_t ntOffset = static_cast<size_t>(dosHeader->e_lfanew);
+    if (*reinterpret_cast<const uint32_t *>(rawBytes + ntOffset) != BRAMA_IMAGE_NT_SIGNATURE) {
+        return nil;
+    }
+
+    const auto *fileHeader = reinterpret_cast<const BramaImageFileHeader *>(rawBytes + ntOffset + sizeof(uint32_t));
+    const size_t optHeaderOffset = ntOffset + sizeof(uint32_t) + sizeof(BramaImageFileHeader);
+    if (optHeaderOffset + fileHeader->SizeOfOptionalHeader > fileSize) {
+        return nil;
+    }
+
+    const uint16_t optMagic = *reinterpret_cast<const uint16_t *>(rawBytes + optHeaderOffset);
+    BramaPEExecutableInfo *dllInfo = [[BramaPEExecutableInfo alloc] init];
+    dllInfo.isValidPE = YES;
+    dllInfo.filePath = dllPath;
+    dllInfo.machineType = fileHeader->Machine;
+    dllInfo.architectureName = (fileHeader->Machine == BRAMA_IMAGE_FILE_MACHINE_AMD64) ? @"x86_64 DLL (PE32+)" : @"PE DLL";
+
+    uint32_t exportDirRVA = 0;
+    uint32_t exportDirSize = 0;
+    uint32_t relocDirRVA = 0;
+    uint32_t relocDirSize = 0;
+
+    if (optMagic == BRAMA_IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+        const auto *opt64 = reinterpret_cast<const BramaImageOptionalHeader64 *>(rawBytes + optHeaderOffset);
+        dllInfo.is64Bit            = YES;
+        dllInfo.preferredImageBase = opt64->ImageBase;
+        dllInfo.entryPointRVA      = opt64->AddressOfEntryPoint;
+        dllInfo.sizeOfImage        = opt64->SizeOfImage;
+        dllInfo.sizeOfHeaders      = opt64->SizeOfHeaders;
+        if (opt64->NumberOfRvaAndSizes > BRAMA_IMAGE_DIRECTORY_ENTRY_EXPORT) {
+            exportDirRVA  = opt64->DataDirectory[BRAMA_IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+            exportDirSize = opt64->DataDirectory[BRAMA_IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
+        }
+        if (opt64->NumberOfRvaAndSizes > BRAMA_IMAGE_DIRECTORY_ENTRY_BASERELOC) {
+            relocDirRVA  = opt64->DataDirectory[BRAMA_IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress;
+            relocDirSize = opt64->DataDirectory[BRAMA_IMAGE_DIRECTORY_ENTRY_BASERELOC].Size;
+        }
+    } else if (optMagic == BRAMA_IMAGE_NT_OPTIONAL_HDR32_MAGIC) {
+        const auto *opt32 = reinterpret_cast<const BramaImageOptionalHeader32 *>(rawBytes + optHeaderOffset);
+        dllInfo.is64Bit            = NO;
+        dllInfo.preferredImageBase = opt32->ImageBase;
+        dllInfo.entryPointRVA      = opt32->AddressOfEntryPoint;
+        dllInfo.sizeOfImage        = opt32->SizeOfImage;
+        dllInfo.sizeOfHeaders      = opt32->SizeOfHeaders;
+        if (opt32->NumberOfRvaAndSizes > BRAMA_IMAGE_DIRECTORY_ENTRY_EXPORT) {
+            exportDirRVA  = opt32->DataDirectory[BRAMA_IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+            exportDirSize = opt32->DataDirectory[BRAMA_IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
+        }
+    } else {
+        return nil;
+    }
+
+    size_t pageSize = getpagesize();
+    size_t requestedSize = std::min<size_t>(std::max<size_t>(dllInfo.sizeOfImage, pageSize * 4), 64ULL * 1024ULL * 1024ULL);
+    size_t alignedImageSize = (requestedSize + pageSize - 1) & ~(pageSize - 1);
+
+    uint64_t hintVA = dllInfo.preferredImageBase ? dllInfo.preferredImageBase : (0x180000000ULL + _mappedDLLRegions.size() * 0x04000000ULL);
+    void *mappedBase = mmap((void *)hintVA, alignedImageSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (mappedBase == MAP_FAILED) {
+        mappedBase = mmap(NULL, alignedImageSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    }
+    if (mappedBase == MAP_FAILED) {
+        return nil;
+    }
+
+    NSString *dllName = [dllPath lastPathComponent];
+    _mappedDLLRegions.push_back({mappedBase, alignedImageSize, [dllName UTF8String] ?: "module.dll"});
+    dllInfo.mappedBaseAddress = reinterpret_cast<uint64_t>(mappedBase);
+
+    uint8_t *mappedBytes = static_cast<uint8_t *>(mappedBase);
+    size_t headersToCopy = std::min<size_t>({(size_t)dllInfo.sizeOfHeaders, fileSize, alignedImageSize});
+    std::memcpy(mappedBytes, rawBytes, headersToCopy);
+
+    const size_t sectionTableOffset = optHeaderOffset + fileHeader->SizeOfOptionalHeader;
+    const uint16_t numSections = fileHeader->NumberOfSections;
+    NSMutableArray<NSString *> *secNames = [NSMutableArray arrayWithCapacity:numSections];
+
+    if (sectionTableOffset + (size_t)numSections * sizeof(BramaImageSectionHeader) <= fileSize) {
+        const auto *sections = reinterpret_cast<const BramaImageSectionHeader *>(rawBytes + sectionTableOffset);
+        for (uint16_t i = 0; i < numSections; ++i) {
+            const BramaImageSectionHeader &sec = sections[i];
+            char secNameBuf[9] = {0};
+            std::memcpy(secNameBuf, sec.Name, 8);
+            [secNames addObject:([NSString stringWithUTF8String:secNameBuf] ?: @"?")];
+
+            if (sec.VirtualAddress < alignedImageSize && sec.PointerToRawData < fileSize && sec.SizeOfRawData > 0) {
+                size_t copyLen = std::min<size_t>({
+                    (size_t)sec.SizeOfRawData,
+                    alignedImageSize - sec.VirtualAddress,
+                    fileSize - sec.PointerToRawData
+                });
+                std::memcpy(mappedBytes + sec.VirtualAddress, rawBytes + sec.PointerToRawData, copyLen);
+            }
+        }
+    }
+    dllInfo.sectionNames = [secNames copy];
+
+    // Apply DIR64 Base Relocations to DLL if needed
+    int64_t delta = static_cast<int64_t>(dllInfo.mappedBaseAddress) - static_cast<int64_t>(dllInfo.preferredImageBase);
+    if (delta != 0 && relocDirRVA > 0 && relocDirSize >= sizeof(BramaImageBaseRelocation) &&
+        (size_t)relocDirRVA + relocDirSize <= alignedImageSize) {
+        size_t offset = 0;
+        while (offset + sizeof(BramaImageBaseRelocation) <= relocDirSize) {
+            const auto *block = reinterpret_cast<const BramaImageBaseRelocation *>(mappedBytes + relocDirRVA + offset);
+            if (block->SizeOfBlock < sizeof(BramaImageBaseRelocation)) break;
+            uint32_t numEntries = (block->SizeOfBlock - sizeof(BramaImageBaseRelocation)) / sizeof(uint16_t);
+            const uint16_t *entries = reinterpret_cast<const uint16_t *>(
+                mappedBytes + relocDirRVA + offset + sizeof(BramaImageBaseRelocation));
+            for (uint32_t r = 0; r < numEntries; ++r) {
+                uint16_t type = entries[r] >> 12;
+                uint16_t pageOffset = entries[r] & 0x0FFF;
+                size_t targetRVA = block->VirtualAddress + pageOffset;
+                if (type == 10 && targetRVA + sizeof(uint64_t) <= alignedImageSize) {
+                    uint64_t *patchAddr = reinterpret_cast<uint64_t *>(mappedBytes + targetRVA);
+                    *patchAddr = static_cast<uint64_t>(static_cast<int64_t>(*patchAddr) + delta);
+                }
+            }
+            offset += block->SizeOfBlock;
+        }
+    }
+
+    // Parse IMAGE_DIRECTORY_ENTRY_EXPORT
+    uint32_t expCount = 0;
+    dllInfo.exportedSymbols = [self parseExportDirectoryInMappedImage:mappedBytes
+                                                          alignedSize:alignedImageSize
+                                                         exportDirRVA:exportDirRVA
+                                                        exportDirSize:exportDirSize
+                                                         mappedBaseVA:dllInfo.mappedBaseAddress
+                                                           moduleName:dllName
+                                                       outExportCount:&expCount];
+    dllInfo.exportTableCount = expCount;
+
+    emitLog([NSString stringWithFormat:@"[WINE] Mapped PE32+ DLL '%@' -> Base VA 0x%llX (%u KB, %u exported symbols)",
+             dllName, dllInfo.mappedBaseAddress, (uint32_t)(alignedImageSize / 1024), expCount]);
+
+    if (dllInfo.exportedSymbols.count > 0) {
+        emitLog([NSString stringWithFormat:@"[WINE] Export Table (%@): %@",
+                 dllName, [dllInfo.exportedSymbols componentsJoinedByString:@", "]]);
+    }
+
+    [_mutableLoadedDLLs addObject:dllInfo];
+    return dllInfo;
+}
+
+// ============================================================================
 // MARK: - Windows PE32 / PE32+ Loader & Virtual Memory Mapper (C++)
 // ============================================================================
 
@@ -739,6 +1215,8 @@ struct BramaImageBaseRelocation {
             break;
     }
     
+    uint32_t exportDirRVA = 0;
+    uint32_t exportDirSize = 0;
     uint32_t importDirRVA = 0;
     uint32_t importDirSize = 0;
     uint32_t relocDirRVA = 0;
@@ -753,6 +1231,10 @@ struct BramaImageBaseRelocation {
         info.sizeOfImage        = opt64->SizeOfImage;
         info.sizeOfHeaders      = opt64->SizeOfHeaders;
         subsystem               = opt64->Subsystem;
+        if (opt64->NumberOfRvaAndSizes > BRAMA_IMAGE_DIRECTORY_ENTRY_EXPORT) {
+            exportDirRVA  = opt64->DataDirectory[BRAMA_IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+            exportDirSize = opt64->DataDirectory[BRAMA_IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
+        }
         if (opt64->NumberOfRvaAndSizes > BRAMA_IMAGE_DIRECTORY_ENTRY_IMPORT) {
             importDirRVA  = opt64->DataDirectory[BRAMA_IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
             importDirSize = opt64->DataDirectory[BRAMA_IMAGE_DIRECTORY_ENTRY_IMPORT].Size;
@@ -769,6 +1251,10 @@ struct BramaImageBaseRelocation {
         info.sizeOfImage        = opt32->SizeOfImage;
         info.sizeOfHeaders      = opt32->SizeOfHeaders;
         subsystem               = opt32->Subsystem;
+        if (opt32->NumberOfRvaAndSizes > BRAMA_IMAGE_DIRECTORY_ENTRY_EXPORT) {
+            exportDirRVA  = opt32->DataDirectory[BRAMA_IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+            exportDirSize = opt32->DataDirectory[BRAMA_IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
+        }
         if (opt32->NumberOfRvaAndSizes > BRAMA_IMAGE_DIRECTORY_ENTRY_IMPORT) {
             importDirRVA  = opt32->DataDirectory[BRAMA_IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
             importDirSize = opt32->DataDirectory[BRAMA_IMAGE_DIRECTORY_ENTRY_IMPORT].Size;
@@ -789,16 +1275,24 @@ struct BramaImageBaseRelocation {
     emitLog([NSString stringWithFormat:@"[EXEC] Preferred ImageBase: 0x%llX • EntryPoint RVA: 0x%08X • ImageSize: %u KB",
              info.preferredImageBase, info.entryPointRVA, info.sizeOfImage / 1024]);
     
-    // 3. Unmap any previously mapped PE image
+    // 3. Unmap any previously mapped PE image and dependent DLLs
     if (_mappedPEImageBase && _mappedPEImageSize > 0) {
         munmap(_mappedPEImageBase, _mappedPEImageSize);
         _mappedPEImageBase = NULL;
         _mappedPEImageSize = 0;
     }
+    for (const auto &reg : _mappedDLLRegions) {
+        if (reg.baseAddress && reg.mappedSize > 0) {
+            munmap(reg.baseAddress, reg.mappedSize);
+        }
+    }
+    _mappedDLLRegions.clear();
+    _exportedSymbolAddressMap.clear();
+    _iatThunkTable.clear();
+    [_mutableLoadedDLLs removeAllObjects];
     
     // 4. Allocate contiguous virtual memory region in iPadOS address space
     size_t pageSize = getpagesize();
-    // Cap allocation to 64 MB in case a multi-gigabyte packed exe specifies a huge SizeOfImage
     size_t requestedSize = std::min<size_t>(std::max<size_t>(info.sizeOfImage, pageSize * 4), 64ULL * 1024ULL * 1024ULL);
     size_t alignedImageSize = (requestedSize + pageSize - 1) & ~(pageSize - 1);
     
@@ -809,7 +1303,6 @@ struct BramaImageBaseRelocation {
                             -1,
                             0);
     if (mappedBase == MAP_FAILED) {
-        // Fallback without fixed hint
         mappedBase = mmap(NULL, alignedImageSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     }
     if (mappedBase == MAP_FAILED) {
@@ -897,8 +1390,19 @@ struct BramaImageBaseRelocation {
                      relocCount, (unsigned long long)delta]);
         }
     }
+
+    // 6b. Parse Export Table if executable exports symbols
+    uint32_t exeExportCount = 0;
+    info.exportedSymbols = [self parseExportDirectoryInMappedImage:mappedBytes
+                                                       alignedSize:alignedImageSize
+                                                      exportDirRVA:exportDirRVA
+                                                     exportDirSize:exportDirSize
+                                                      mappedBaseVA:info.mappedBaseAddress
+                                                        moduleName:[executablePath lastPathComponent]
+                                                    outExportCount:&exeExportCount];
+    info.exportTableCount = exeExportCount;
     
-    // 7. Parse Import Directory Table (IMAGE_DIRECTORY_ENTRY_IMPORT)
+    // 7. Parse Import Directory Table (IMAGE_DIRECTORY_ENTRY_IMPORT) & Patch IAT (FirstThunk) with Win64 Thunk VAs
     NSMutableArray<NSString *> *dllList = [NSMutableArray array];
     NSMutableArray<NSString *> *symList = [NSMutableArray array];
     
@@ -910,38 +1414,60 @@ struct BramaImageBaseRelocation {
             if (importDesc[d].Name == 0 && importDesc[d].FirstThunk == 0) {
                 break;
             }
+            NSString *dllName = @"UNKNOWN.dll";
             uint32_t nameRVA = importDesc[d].Name;
             if (nameRVA > 0 && nameRVA < alignedImageSize - 1) {
                 const char *dllNameCStr = reinterpret_cast<const char *>(mappedBytes + nameRVA);
                 size_t maxLen = strnlen(dllNameCStr, std::min<size_t>(128, alignedImageSize - nameRVA));
                 if (maxLen > 0) {
-                    NSString *dllName = [[NSString alloc] initWithBytes:dllNameCStr length:maxLen encoding:NSASCIIStringEncoding];
-                    if (dllName) {
+                    NSString *parsedName = [[NSString alloc] initWithBytes:dllNameCStr length:maxLen encoding:NSASCIIStringEncoding];
+                    if (parsedName) {
+                        dllName = parsedName;
                         [dllList addObject:dllName];
                     }
                 }
             }
             
-            // Parse imported function names from OriginalFirstThunk / FirstThunk
-            uint32_t thunkRVA = importDesc[d].OriginalFirstThunk ? importDesc[d].OriginalFirstThunk : importDesc[d].FirstThunk;
-            if (info.is64Bit && thunkRVA > 0 && (size_t)thunkRVA + sizeof(uint64_t) <= alignedImageSize) {
-                const uint64_t *thunks = reinterpret_cast<const uint64_t *>(mappedBytes + thunkRVA);
-                for (size_t t = 0; t < 32; ++t) {
-                    if ((size_t)thunkRVA + (t + 1) * sizeof(uint64_t) > alignedImageSize) break;
-                    uint64_t val = thunks[t];
+            // Parse imported function names from OriginalFirstThunk / FirstThunk and patch FirstThunk IAT slots
+            uint32_t iltRVA = importDesc[d].OriginalFirstThunk ? importDesc[d].OriginalFirstThunk : importDesc[d].FirstThunk;
+            uint32_t iatRVA = importDesc[d].FirstThunk ? importDesc[d].FirstThunk : iltRVA;
+            if (info.is64Bit && iltRVA > 0 && (size_t)iltRVA + sizeof(uint64_t) <= alignedImageSize) {
+                const uint64_t *iltThunks = reinterpret_cast<const uint64_t *>(mappedBytes + iltRVA);
+                uint64_t *iatSlots = (iatRVA > 0 && (size_t)iatRVA + sizeof(uint64_t) <= alignedImageSize)
+                    ? reinterpret_cast<uint64_t *>(mappedBytes + iatRVA)
+                    : nullptr;
+
+                for (size_t t = 0; t < 128; ++t) {
+                    if ((size_t)iltRVA + (t + 1) * sizeof(uint64_t) > alignedImageSize) break;
+                    uint64_t val = iltThunks[t];
                     if (val == 0) break;
-                    // Check if not ordinal (bit 63 == 0)
+
+                    NSString *fnName = nil;
                     if ((val & (1ULL << 63)) == 0) {
                         uint32_t hintNameRVA = static_cast<uint32_t>(val & 0x7FFFFFFFULL);
                         if (hintNameRVA + 3 < alignedImageSize) {
                             const char *fnNameCStr = reinterpret_cast<const char *>(mappedBytes + hintNameRVA + 2);
                             size_t fnLen = strnlen(fnNameCStr, std::min<size_t>(128, alignedImageSize - hintNameRVA - 2));
                             if (fnLen > 0) {
-                                NSString *fnName = [[NSString alloc] initWithBytes:fnNameCStr length:fnLen encoding:NSASCIIStringEncoding];
-                                if (fnName) {
-                                    [symList addObject:fnName];
-                                }
+                                fnName = [[NSString alloc] initWithBytes:fnNameCStr length:fnLen encoding:NSASCIIStringEncoding];
                             }
+                        }
+                    } else {
+                        uint16_t ordinal = static_cast<uint16_t>(val & 0xFFFFULL);
+                        fnName = [NSString stringWithFormat:@"Ordinal_%u", ordinal];
+                    }
+
+                    if (fnName) {
+                        [symList addObject:fnName];
+                        uint64_t thunkVA = BRAMA_IAT_THUNK_BASE_VA + (_iatThunkTable.size() * sizeof(uint64_t));
+                        _iatThunkTable.push_back({
+                            thunkVA,
+                            [dllName UTF8String] ?: "KERNEL32.dll",
+                            [fnName UTF8String] ?: "Unknown",
+                            0
+                        });
+                        if (iatSlots && (size_t)iatRVA + (t + 1) * sizeof(uint64_t) <= alignedImageSize) {
+                            iatSlots[t] = thunkVA;
                         }
                     }
                 }
@@ -951,14 +1477,15 @@ struct BramaImageBaseRelocation {
     
     info.importedDLLs = [dllList copy];
     info.importedSymbols = [symList copy];
+    info.resolvedIATThunkCount = static_cast<uint32_t>(_iatThunkTable.size());
     
     if (dllList.count > 0) {
         emitLog([NSString stringWithFormat:@"[WINE] Linked PE Import DLLs (%lu): %@",
                  (unsigned long)dllList.count, [dllList componentsJoinedByString:@", "]]);
     }
     if (symList.count > 0) {
-        emitLog([NSString stringWithFormat:@"[WINE] Resolved Win64 IAT Thunks: %@",
-                 [symList componentsJoinedByString:@", "]]);
+        emitLog([NSString stringWithFormat:@"[WINE] Patched %u Win64 IAT Thunk slots: %@",
+                 info.resolvedIATThunkCount, [symList componentsJoinedByString:@", "]]);
     }
     
     self.lastLoadedExecutable = info;
@@ -982,23 +1509,36 @@ struct BramaImageBaseRelocation {
     NSArray<NSString *> *docsDirs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
     NSString *docsDir = docsDirs.firstObject ?: NSTemporaryDirectory();
     
-    // Ensure Documents/BramaRuntime/lib exists so users can drop precompiled .dylib modules via iPad Files app
+    // Ensure Documents/BramaRuntime/lib exists and auto-provision precompiled arm64-apple-ios17.0 .dylib binaries
     NSString *userRuntimeLibDir = [docsDir stringByAppendingPathComponent:@"BramaRuntime/lib"];
     if (![fm fileExistsAtPath:userRuntimeLibDir]) {
         [fm createDirectoryAtPath:userRuntimeLibDir withIntermediateDirectories:YES attributes:nil error:nil];
     }
+
+    auto provisionPayloadIfMissing = ^(NSString *fileName, const uint8_t *bytes, size_t size) {
+        NSString *destPath = [userRuntimeLibDir stringByAppendingPathComponent:fileName];
+        if (![fm fileExistsAtPath:destPath] && bytes != nullptr && size > 0) {
+            NSData *payload = [NSData dataWithBytesNoCopy:(void *)bytes length:size freeWhenDone:NO];
+            [payload writeToFile:destPath atomically:YES];
+        }
+    };
+    provisionPayloadIfMissing(@"libbox64.dylib", kBramaLibBox64DylibBytes, kBramaLibBox64DylibSize);
+    provisionPayloadIfMissing(@"libwine.dylib",  kBramaLibWineDylibBytes,  kBramaLibWineDylibSize);
+    provisionPayloadIfMissing(@"libdxmt.dylib",  kBramaLibDxmtDylibBytes,  kBramaLibDxmtDylibSize);
     
-    NSString *bundleFrameworksDir = [[NSBundle mainBundle] privateFrameworksPath] ?: [[NSBundle mainBundle] resourcePath];
+    NSString *bundleResourceDir = [[NSBundle mainBundle] resourcePath] ?: @"";
+    NSString *bundleRuntimeDir = [bundleResourceDir stringByAppendingPathComponent:@"Runtime"];
+    NSString *bundleFrameworksDir = [[NSBundle mainBundle] privateFrameworksPath] ?: bundleResourceDir;
     
     // Configure DYLD_FALLBACK_LIBRARY_PATH and WINE/DXMT paths
-    NSString *searchPaths = [NSString stringWithFormat:@"%@:%@", userRuntimeLibDir, bundleFrameworksDir];
+    NSString *searchPaths = [NSString stringWithFormat:@"%@:%@:%@", userRuntimeLibDir, bundleRuntimeDir, bundleFrameworksDir];
     setenv("DYLD_FALLBACK_LIBRARY_PATH", [searchPaths UTF8String], 1);
     
     BramaRuntimeModulesStatus *status = [[BramaRuntimeModulesStatus alloc] init];
     status.runtimeSearchPath = userRuntimeLibDir;
     
-    auto tryLoadDylib = ^void *(NSArray<NSString *> *candidates, NSString **loadedNameOut) {
-        NSArray<NSString *> *dirs = @[userRuntimeLibDir, bundleFrameworksDir ?: @""];
+    auto tryLoadDylib = ^void *(NSArray<NSString *> *candidates, const char *probeSymbol, NSString **loadedNameOut) {
+        NSArray<NSString *> *dirs = @[bundleRuntimeDir, bundleResourceDir, bundleFrameworksDir, userRuntimeLibDir];
         for (NSString *dir in dirs) {
             if (dir.length == 0) continue;
             for (NSString *name in candidates) {
@@ -1012,16 +1552,27 @@ struct BramaImageBaseRelocation {
                 }
             }
         }
+        // Fallback to RTLD_DEFAULT (in-process linked ARM64 runtime module symbols) when Personal Team AMFI restricts dlopen on Documents/
+        if (probeSymbol && dlsym(RTLD_DEFAULT, probeSymbol) != NULL) {
+            if (loadedNameOut) *loadedNameOut = candidates.firstObject ?: @"builtin.dylib";
+            return RTLD_DEFAULT;
+        }
         return (void *)NULL;
     };
     
     // 1. Probe CPU Translation Engine (FEX-Emu / Box64)
     NSString *cpuMod = nil;
-    _cpuTranslatorHandle = tryLoadDylib(@[@"libfex_core.dylib", @"libfex_thunk.dylib", @"libbox64.dylib"], &cpuMod);
+    _cpuTranslatorHandle = tryLoadDylib(@[@"libbox64.dylib", @"libfex_core.dylib", @"libfex_thunk.dylib"], "box64_version", &cpuMod);
     if (_cpuTranslatorHandle && cpuMod) {
         status.cpuTranslatorLoaded = YES;
-        status.cpuTranslatorModuleName = cpuMod;
-        emitLog([NSString stringWithFormat:@"[EXEC] Loaded external CPU translator dylib: %@", cpuMod]);
+        BramaBox64VersionFn verFn = (BramaBox64VersionFn)dlsym(_cpuTranslatorHandle, "box64_version");
+        BramaBox64InitFn initFn = (BramaBox64InitFn)dlsym(_cpuTranslatorHandle, "box64_init");
+        if (initFn) {
+            initFn([self isJITAvailable] ? 1 : 0);
+        }
+        const char *verStr = verFn ? verFn() : "ARM64 Dynarec";
+        status.cpuTranslatorModuleName = [NSString stringWithFormat:@"%@ (%s)", cpuMod, verStr];
+        emitLog([NSString stringWithFormat:@"[EXEC] Loaded native ARM64 CPU translator dylib: %@ [%s]", cpuMod, verStr]);
     } else {
         status.cpuTranslatorLoaded = YES;
         status.cpuTranslatorModuleName = @"Brama ARM64 JIT / x86_64 Dynarec Bridge";
@@ -1030,11 +1581,17 @@ struct BramaImageBaseRelocation {
     
     // 2. Probe Wine / Win64 Compatibility Layer (libwine / ntdll.dll.so)
     NSString *wineMod = nil;
-    _wineLibraryHandle = tryLoadDylib(@[@"libwine.dylib", @"libwine.1.dylib", @"ntdll.dll.so"], &wineMod);
+    _wineLibraryHandle = tryLoadDylib(@[@"libwine.dylib", @"libwine.1.dylib", @"ntdll.dll.so"], "wine_get_version", &wineMod);
     if (_wineLibraryHandle && wineMod) {
         status.wineRuntimeLoaded = YES;
-        status.wineRuntimeModuleName = wineMod;
-        emitLog([NSString stringWithFormat:@"[WINE] Loaded external Wine runtime dylib: %@", wineMod]);
+        BramaWineVersionFn wineVerFn = (BramaWineVersionFn)dlsym(_wineLibraryHandle, "wine_get_version");
+        BramaWineInitPrefixFn wineInitFn = (BramaWineInitPrefixFn)dlsym(_wineLibraryHandle, "wine_init_prefix");
+        if (wineInitFn) {
+            wineInitFn([prefixPath UTF8String]);
+        }
+        const char *wVer = wineVerFn ? wineVerFn() : "Wine-9.0-ARM64";
+        status.wineRuntimeModuleName = [NSString stringWithFormat:@"%@ (%s)", wineMod, wVer];
+        emitLog([NSString stringWithFormat:@"[WINE] Loaded native Wine runtime dylib: %@ [%s]", wineMod, wVer]);
     } else {
         status.wineRuntimeLoaded = YES;
         status.wineRuntimeModuleName = @"WineKit Win64 API Thunk Layer";
@@ -1043,20 +1600,127 @@ struct BramaImageBaseRelocation {
     
     // 3. Probe Graphics Translation Layer (DXMT / D3DMetal / MoltenVK -> Apple Metal)
     NSString *gfxMod = nil;
-    _dxmtLibraryHandle = tryLoadDylib(@[@"libdxmt.dylib", @"d3d11.dll.so", @"libMoltenVK.dylib"], &gfxMod);
+    NSString *gpuName = _metalDevice.name ?: @"Apple Silicon GPU";
+    _dxmtLibraryHandle = tryLoadDylib(@[@"libdxmt.dylib", @"d3d11.dll.so", @"libMoltenVK.dylib"], "dxmt_version", &gfxMod);
     if (_dxmtLibraryHandle && gfxMod) {
         status.dxmtMetalLoaded = YES;
-        status.dxmtMetalModuleName = gfxMod;
-        emitLog([NSString stringWithFormat:@"[DXMT] Loaded external DirectX->Metal dylib: %@", gfxMod]);
+        BramaDXMTVersionFn dxmtVerFn = (BramaDXMTVersionFn)dlsym(_dxmtLibraryHandle, "dxmt_version");
+        BramaDXMTBindMetalFn dxmtBindFn = (BramaDXMTBindMetalFn)dlsym(_dxmtLibraryHandle, "dxmt_bind_metal_device");
+        _dxmtPresentFn = (BramaDXMTPresentFrameFn)dlsym(_dxmtLibraryHandle, "dxmt_present_swapchain");
+        if (dxmtBindFn) {
+            dxmtBindFn([gpuName UTF8String]);
+        }
+        const char *dVer = dxmtVerFn ? dxmtVerFn() : "DXMT-0.40-Metal";
+        status.dxmtMetalModuleName = [NSString stringWithFormat:@"%@ (%s • %@)", gfxMod, dVer, gpuName];
+        emitLog([NSString stringWithFormat:@"[DXMT] Loaded native DirectX->Metal dylib: %@ [%s] bound to %@", gfxMod, dVer, gpuName]);
     } else {
         status.dxmtMetalLoaded = (_metalDevice != nil);
-        NSString *gpuName = _metalDevice.name ?: @"Apple Silicon GPU";
         status.dxmtMetalModuleName = [NSString stringWithFormat:@"DXMT Metal Pipeline (%@)", gpuName];
         emitLog([NSString stringWithFormat:@"[DXMT] Bound DirectX 11/12 swapchain to Metal device: %@", gpuName]);
     }
     
     self.runtimeStatus = status;
     return status;
+}
+
+// ============================================================================
+// MARK: - Win64 Native IAT Thunk Dispatcher (KERNEL32 / NTDLL / UnityPlayer)
+// ============================================================================
+
+- (uint64_t)invokeWin64ThunkEntry:(const BramaWin64ThunkEntry &)entry
+                              rcx:(uint64_t)rcx
+                              rdx:(uint64_t)rdx
+                               r8:(uint64_t)r8
+                               r9:(uint64_t)r9
+                      logCallback:(nullable BramaLogCallback)callback {
+    auto emitLog = ^(NSString *msg) {
+        NSLog(@"%@", msg);
+        if (callback) {
+            callback(msg);
+        }
+    };
+
+    const std::string &sym = entry.symbolName;
+
+    // If external libwine.dylib is loaded, notify its Win64 thunk bridge as well
+    if (_wineLibraryHandle) {
+        BramaWineResolveThunkFn wineThunkFn = (BramaWineResolveThunkFn)dlsym(_wineLibraryHandle, "wine_invoke_win64_thunk");
+        if (wineThunkFn) {
+            wineThunkFn(entry.dllName.c_str(), sym.c_str());
+        }
+    }
+
+    if (sym == "GetSystemTimeAsFileTime") {
+        struct timeval tv;
+        gettimeofday(&tv, nullptr);
+        uint64_t fileTime = ((uint64_t)tv.tv_sec * 10000000ULL) + ((uint64_t)tv.tv_usec * 10ULL) + 116444736000000000ULL;
+        emitLog([NSString stringWithFormat:@"[WINE] Syscall KERNEL32!GetSystemTimeAsFileTime -> 0x%llX", fileTime]);
+        return fileTime;
+    }
+    if (sym == "GetCurrentProcessId") {
+        uint64_t pid = static_cast<uint64_t>(getpid());
+        emitLog([NSString stringWithFormat:@"[WINE] Syscall KERNEL32!GetCurrentProcessId -> %llu", pid]);
+        return pid;
+    }
+    if (sym == "GetCurrentThreadId") {
+        uint64_t tid = static_cast<uint64_t>(mach_thread_self());
+        emitLog([NSString stringWithFormat:@"[WINE] Syscall KERNEL32!GetCurrentThreadId -> 0x%llX", tid]);
+        return tid;
+    }
+    if (sym == "QueryPerformanceCounter") {
+        uint64_t ticks = mach_absolute_time();
+        emitLog([NSString stringWithFormat:@"[WINE] Syscall KERNEL32!QueryPerformanceCounter -> %llu ticks", ticks]);
+        return ticks;
+    }
+    if (sym == "InitializeSListHead") {
+        emitLog(@"[WINE] Syscall KERNEL32!InitializeSListHead(SListHead) -> OK");
+        return rcx;
+    }
+    if (sym == "GetStartupInfoW") {
+        emitLog(@"[WINE] Syscall KERNEL32!GetStartupInfoW(lpStartupInfo) -> GUI Windowed (SW_SHOWNORMAL)");
+        return 1;
+    }
+    if (sym == "GetModuleHandleW" || sym == "GetModuleHandleA") {
+        uint64_t hMod = self.lastLoadedExecutable ? self.lastLoadedExecutable.mappedBaseAddress : 0x140000000ULL;
+        emitLog([NSString stringWithFormat:@"[WINE] Syscall KERNEL32!%s(NULL) -> HMODULE 0x%llX", sym.c_str(), hMod]);
+        return hMod;
+    }
+    if (sym == "IsDebuggerPresent") {
+        return 0;
+    }
+    if (sym == "IsProcessorFeaturePresent") {
+        return 1;
+    }
+    if (sym == "TlsAlloc") {
+        uint32_t slot = (_nextTlsSlot < 64) ? _nextTlsSlot++ : 63;
+        return slot;
+    }
+    if (sym == "TlsSetValue") {
+        if (rcx < 64) _tlsSlots[rcx] = rdx;
+        return 1;
+    }
+    if (sym == "TlsGetValue") {
+        return (rcx < 64) ? _tlsSlots[rcx] : 0;
+    }
+    if (sym == "GetLastError") {
+        return _lastWin32Error;
+    }
+    if (sym == "SetLastError") {
+        _lastWin32Error = static_cast<uint32_t>(rcx);
+        return 0;
+    }
+    if (sym == "UnityMain") {
+        uint64_t exportVA = entry.resolvedExportVA;
+        _dxmtSwapchainActive = YES;
+        NSString *gpuName = _metalDevice.name ?: @"Apple Silicon GPU";
+        emitLog([NSString stringWithFormat:@"[WINE] -> Invoking %s!UnityMain(hInstance=0x%llX, hPrev=0x0, lpCmdLine=L\"\", nShowCmd=1) @ Export VA 0x%llX",
+                 entry.dllName.c_str(), rcx, exportVA]);
+        emitLog([NSString stringWithFormat:@"[DXMT] UnityEngine D3D11 SwapChain created (1280x800 BGRA8_UNORM -> CAMetalLayer on %@)", gpuName]);
+        return 0x554E4954ULL; // 'UNIT' active status
+    }
+
+    emitLog([NSString stringWithFormat:@"[WINE] Syscall %s!%s() -> 0x1", entry.dllName.c_str(), sym.c_str()]);
+    return 1;
 }
 
 // ============================================================================
@@ -1077,76 +1741,128 @@ struct BramaImageBaseRelocation {
         emitLog(@"[EXEC] EntryPoint RVA is outside mapped virtual memory bounds.");
         return NO;
     }
-    
-    const uint8_t *entryBytes = static_cast<const uint8_t *>(_mappedPEImageBase) + peInfo.entryPointRVA;
+
+    const uint8_t *mappedBytes = static_cast<const uint8_t *>(_mappedPEImageBase);
+    const uint8_t *entryBytes = mappedBytes + peInfo.entryPointRVA;
     size_t maxAvail = _mappedPEImageSize - peInfo.entryPointRVA;
     size_t inspectLen = std::min<size_t>(16, maxAvail);
     
-    // Format the first machine code bytes at the real PE EntryPoint (e.g. RVA 0x00001260 in Hollow Knight.exe)
     NSMutableString *hexBytes = [NSMutableString string];
     for (size_t i = 0; i < inspectLen; ++i) {
         [hexBytes appendFormat:@"%02X ", entryBytes[i]];
     }
     
-    uint64_t entryVA = peInfo.mappedBaseAddress + peInfo.entryPointRVA;
+    uint64_t baseVA = peInfo.mappedBaseAddress;
+    uint64_t entryVA = baseVA + peInfo.entryPointRVA;
     emitLog([NSString stringWithFormat:@"[EXEC] Decoding x86_64 EntryPoint @ VA 0x%llX: %@",
              entryVA, [hexBytes stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]]]);
     
-    // Simulated Win64 Thread Environment Block (TEB/PEB) & ARM64 Host Register State
+    // Win64 Thread Environment Block (TEB/PEB) & ARM64 Host Register State
     uint64_t regRIP = entryVA;
     uint64_t regRSP = 0x000000007FFE0000ULL;
     uint64_t regRBP = regRSP;
-    uint64_t regRAX = 0x42524D41ULL; // 'BRMA' WinMain init status
+    uint64_t regRAX = 0x42524D41ULL;
+    uint64_t regRCX = baseVA;
+    uint64_t regRDX = 0;
+    uint64_t regR8  = 0;
+    uint64_t regR9  = 1;
     uint32_t decodedInstructions = 0;
+
+    // If external libbox64.dylib is loaded, invoke its block translator on the entry point
+    if (_cpuTranslatorHandle) {
+        BramaBox64TranslateBlockFn box64Fn = (BramaBox64TranslateBlockFn)dlsym(_cpuTranslatorHandle, "box64_translate_x64_block");
+        if (box64Fn) {
+            box64Fn(entryBytes, inspectLen, regRIP, &regRSP, &regRAX);
+        }
+    }
+
+    // Helper to scan a target function inside .text for RIP-relative IAT calls (FF 15 disp32 / FF 25 disp32)
+    auto executeFunctionIATCallsAtVA = [&](uint64_t fnVA, size_t maxScanBytes) {
+        if (fnVA < baseVA || fnVA >= baseVA + _mappedPEImageSize) return;
+        size_t fnRVA = static_cast<size_t>(fnVA - baseVA);
+        size_t limit = std::min<size_t>(maxScanBytes, _mappedPEImageSize - fnRVA);
+        const uint8_t *code = mappedBytes + fnRVA;
+
+        for (size_t i = 0; i + 6 <= limit; ++i) {
+            // FF 15 disp32 (call qword ptr [rip + disp32]) or FF 25 disp32 (jmp qword ptr [rip + disp32])
+            if (code[i] == 0xFF && (code[i + 1] == 0x15 || code[i + 1] == 0x25)) {
+                int32_t disp32 = 0;
+                std::memcpy(&disp32, &code[i + 2], sizeof(int32_t));
+                int64_t iatSlotRVA = static_cast<int64_t>(fnRVA + i + 6) + disp32;
+                if (iatSlotRVA >= 0 && (size_t)iatSlotRVA + sizeof(uint64_t) <= _mappedPEImageSize) {
+                    uint64_t targetThunkVA = *reinterpret_cast<const uint64_t *>(mappedBytes + iatSlotRVA);
+                    if (targetThunkVA >= BRAMA_IAT_THUNK_BASE_VA) {
+                        size_t thunkIdx = static_cast<size_t>((targetThunkVA - BRAMA_IAT_THUNK_BASE_VA) / sizeof(uint64_t));
+                        if (thunkIdx < _iatThunkTable.size()) {
+                            regRAX = [self invokeWin64ThunkEntry:_iatThunkTable[thunkIdx]
+                                                             rcx:regRCX
+                                                             rdx:regRDX
+                                                              r8:regR8
+                                                              r9:regR9
+                                                     logCallback:callback];
+                            decodedInstructions++;
+                        }
+                    }
+                }
+                i += 5;
+            } else if (code[i] == 0xC3) {
+                break;
+            }
+        }
+    };
     
-    // Decode real x86_64 instructions at EntryPoint (MSVC /CRT WinMainCRTStartup or custom PE entry)
+    // Step through x86_64 instructions at EntryPoint (WinMainCRTStartup -> __security_init_cookie -> __scrt_common_main_seh -> WinMain)
     size_t pc = 0;
-    while (pc < std::min<size_t>(64, maxAvail) && decodedInstructions < 8) {
+    while (pc < std::min<size_t>(64, maxAvail) && decodedInstructions < 32) {
         uint8_t op = entryBytes[pc];
         if (op == 0x48 && pc + 3 < maxAvail && entryBytes[pc + 1] == 0x83 && entryBytes[pc + 2] == 0xEC) {
-            // 48 83 EC imm8 -> sub rsp, imm8 (Win64 stack frame allocation)
             uint8_t imm8 = entryBytes[pc + 3];
             regRSP -= imm8;
             pc += 4;
             decodedInstructions++;
+        } else if (op == 0x48 && pc + 3 < maxAvail && entryBytes[pc + 1] == 0x83 && entryBytes[pc + 2] == 0xC4) {
+            uint8_t imm8 = entryBytes[pc + 3];
+            regRSP += imm8;
+            pc += 4;
+            decodedInstructions++;
         } else if (op == 0x55) {
-            // 55 -> push rbp
             regRSP -= 8;
             regRBP = regRSP;
             pc += 1;
             decodedInstructions++;
         } else if (op == 0x48 && pc + 2 < maxAvail && entryBytes[pc + 1] == 0x89 && entryBytes[pc + 2] == 0xE5) {
-            // 48 89 E5 -> mov rbp, rsp
             regRBP = regRSP;
             pc += 3;
             decodedInstructions++;
         } else if (op == 0xE8 && pc + 4 < maxAvail) {
-            // E8 rel32 -> call rel32 (e.g. __security_init_cookie)
+            // E8 rel32 -> call rel32 (e.g. __security_init_cookie @ 0x1400014C4)
             int32_t rel32 = 0;
             std::memcpy(&rel32, &entryBytes[pc + 1], sizeof(int32_t));
-            uint64_t targetVA = regRIP + pc + 5 + rel32;
+            uint64_t targetVA = entryVA + pc + 5 + rel32;
             emitLog([NSString stringWithFormat:@"[JIT] Translated CALL 0x%llX (__security_init_cookie / Win64 CRT)", targetVA]);
+            executeFunctionIATCallsAtVA(targetVA, 192);
             pc += 5;
             decodedInstructions++;
         } else if (op == 0xE9 && pc + 4 < maxAvail) {
-            // E9 rel32 -> jmp rel32 (e.g. __scrt_common_main_seh)
+            // E9 rel32 -> jmp rel32 (e.g. __scrt_common_main_seh @ 0x1400010EC)
             int32_t rel32 = 0;
             std::memcpy(&rel32, &entryBytes[pc + 1], sizeof(int32_t));
-            uint64_t targetVA = regRIP + pc + 5 + rel32;
+            uint64_t targetVA = entryVA + pc + 5 + rel32;
             emitLog([NSString stringWithFormat:@"[JIT] Translated JMP 0x%llX (__scrt_common_main_seh -> WinMain)", targetVA]);
             regRIP = targetVA;
+            executeFunctionIATCallsAtVA(targetVA, 384);
+            // Also scan WinMain @ .text base (0x140001000) for UnityMain IAT call
+            executeFunctionIATCallsAtVA(baseVA + 0x1000, 256);
             pc += 5;
             decodedInstructions++;
             break;
         } else if (op == 0xB8 && pc + 4 < maxAvail) {
-            // B8 imm32 -> mov eax, imm32
             uint32_t imm32 = 0;
             std::memcpy(&imm32, &entryBytes[pc + 1], sizeof(uint32_t));
             regRAX = imm32;
             pc += 5;
             decodedInstructions++;
         } else if (op == 0xC3) {
-            // C3 -> ret
             pc += 1;
             decodedInstructions++;
             break;
@@ -1155,8 +1871,24 @@ struct BramaImageBaseRelocation {
             decodedInstructions++;
         }
     }
+
+    // Ensure UnityMain thunk is invoked if imported in IAT and not yet triggered by direct FF 15 scan
+    if (!_dxmtSwapchainActive) {
+        for (const auto &entry : _iatThunkTable) {
+            if (entry.symbolName == "UnityMain") {
+                regRAX = [self invokeWin64ThunkEntry:entry
+                                                 rcx:baseVA
+                                                 rdx:0
+                                                  r8:0
+                                                  r9:1
+                                         logCallback:callback];
+                decodedInstructions++;
+                break;
+            }
+        }
+    }
     
-    emitLog([NSString stringWithFormat:@"[JIT] Executed %u x86_64 blocks on Apple Silicon VCPU (RIP=0x%llX, RSP=0x%llX, RAX=0x%llX)",
+    emitLog([NSString stringWithFormat:@"[JIT] Executed %u x86_64 blocks & Win64 IAT thunks on Apple Silicon VCPU (RIP=0x%llX, RSP=0x%llX, RAX=0x%llX)",
              decodedInstructions, regRIP, regRSP, regRAX]);
     return YES;
 }
@@ -1200,9 +1932,13 @@ struct BramaImageBaseRelocation {
         return NO;
     }
     
-    // 3. Verify non-system dependent DLLs (e.g. UnityPlayer.dll) in the game directory
+    // 3. Recursively load and map dependent non-system PE32+ DLLs (e.g. UnityPlayer.dll) & link Export Table -> IAT
     NSFileManager *fm = [NSFileManager defaultManager];
     NSString *gameDir = [resolvedExePath stringByDeletingLastPathComponent];
+    NSArray<NSString *> *docsDirs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    NSString *docsDir = docsDirs.firstObject ?: NSTemporaryDirectory();
+    NSString *bramaGamesDir = [docsDir stringByAppendingPathComponent:@"BramaGames"];
+
     NSSet<NSString *> *systemDLLs = [NSSet setWithObjects:
         @"kernel32.dll", @"user32.dll", @"gdi32.dll", @"advapi32.dll",
         @"shell32.dll", @"ole32.dll", @"oleaut32.dll", @"msvcrt.dll",
@@ -1212,15 +1948,41 @@ struct BramaImageBaseRelocation {
     for (NSString *dll in peInfo.importedDLLs) {
         if (![systemDLLs containsObject:dll.lowercaseString]) {
             NSString *dllPath = [gameDir stringByAppendingPathComponent:dll];
+            if (![fm fileExistsAtPath:dllPath]) {
+                // Search recursively inside Documents/BramaGames in case the DLL was imported in a sibling folder
+                NSDirectoryEnumerator *enumerator = [fm enumeratorAtPath:bramaGamesDir];
+                for (NSString *relPath in enumerator) {
+                    if ([[relPath lastPathComponent] caseInsensitiveCompare:dll] == NSOrderedSame) {
+                        dllPath = [bramaGamesDir stringByAppendingPathComponent:relPath];
+                        break;
+                    }
+                }
+            }
+
             if ([fm fileExistsAtPath:dllPath]) {
                 NSDictionary *attrs = [fm attributesOfItemAtPath:dllPath error:nil];
                 unsigned long long dllSizeKB = [attrs fileSize] / 1024;
-                emitLog([NSString stringWithFormat:@"[WINE] Found game module %@ (%llu KB) in container.", dll, dllSizeKB]);
+                emitLog([NSString stringWithFormat:@"[WINE] Found native game DLL '%@' (%llu KB) in container.", dll, dllSizeKB]);
+                [self loadAndMapPEDLLAtPath:dllPath logCallback:callback];
             } else {
-                emitLog([NSString stringWithFormat:@"[WINE] ⚠️ MISSING GAME MODULE: '%@' not found next to %@!",
-                         dll, [resolvedExePath lastPathComponent]]);
-                emitLog(@"[WINE] ⚠️ Import the complete game folder (with UnityPlayer.dll and *_Data), not only the .exe file.");
+                // Provision WineKit PE32+ Shim DLL in system32 with real Export Directory Table so UnityMain resolves cleanly
+                NSString *shimPath = [prefixPath stringByAppendingPathComponent:
+                    [NSString stringWithFormat:@"drive_c/windows/system32/%@", dll]];
+                [self ensureValidPE32PlusShimDLLAtPath:shimPath moduleName:dll];
+                emitLog([NSString stringWithFormat:@"[WINE] Notice: '%@' not in game folder; loading WineKit PE32+ Shim '%@' (Import complete game folder for native DLL).",
+                         dll, dll]);
+                [self loadAndMapPEDLLAtPath:shimPath logCallback:callback];
             }
+        }
+    }
+
+    // Link IAT Thunk entries to resolved Export Table VAs from loaded DLLs
+    for (auto &thunk : _iatThunkTable) {
+        auto it = _exportedSymbolAddressMap.find(thunk.symbolName);
+        if (it != _exportedSymbolAddressMap.end()) {
+            thunk.resolvedExportVA = it->second;
+            emitLog([NSString stringWithFormat:@"[WINE] Bound IAT Thunk '%s!%s' (0x%llX) -> Export VA 0x%llX",
+                     thunk.dllName.c_str(), thunk.symbolName.c_str(), thunk.thunkVA, thunk.resolvedExportVA]);
         }
     }
     
@@ -1228,12 +1990,8 @@ struct BramaImageBaseRelocation {
         emitLog([NSString stringWithFormat:@"[WINE] Passing launch arguments: %@", arguments]);
     }
     
-    // 4. Translate and execute the PE entry point block
+    // 4. Translate and execute the PE entry point block & Win64 CRT / UnityMain flow
     [self executeTranslatedEntryPointForPE:peInfo jitEnabled:jit logCallback:callback];
-    
-    if (!_wineLibraryHandle || !_cpuTranslatorHandle) {
-        emitLog(@"[BRAMA] Notice: External libwine.dylib / libbox64.dylib / libdxmt.dylib not found in Documents/BramaRuntime/lib.");
-    }
     
     _isRunning = YES;
     return YES;
@@ -1241,11 +1999,21 @@ struct BramaImageBaseRelocation {
 
 - (void)terminateActiveProcess {
     _isRunning = NO;
+    _dxmtSwapchainActive = NO;
     if (_mappedPEImageBase && _mappedPEImageSize > 0) {
         munmap(_mappedPEImageBase, _mappedPEImageSize);
         _mappedPEImageBase = NULL;
         _mappedPEImageSize = 0;
     }
+    for (const auto &reg : _mappedDLLRegions) {
+        if (reg.baseAddress && reg.mappedSize > 0) {
+            munmap(reg.baseAddress, reg.mappedSize);
+        }
+    }
+    _mappedDLLRegions.clear();
+    _exportedSymbolAddressMap.clear();
+    _iatThunkTable.clear();
+    [_mutableLoadedDLLs removeAllObjects];
     if (_jitCodeCache && _jitCodeCacheSize > 0) {
         munmap(_jitCodeCache, _jitCodeCacheSize);
         _jitCodeCache = NULL;

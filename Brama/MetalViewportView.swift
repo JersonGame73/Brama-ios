@@ -9,7 +9,7 @@ import SwiftUI
 import MetalKit
 
 struct MetalViewportView: UIViewRepresentable {
-    @ObservedObject var perfManager = PerformanceManager.shared
+    var targetFPSLimit: Int = 60
     
     func makeCoordinator() -> Coordinator {
         Coordinator(self)
@@ -21,22 +21,24 @@ struct MetalViewportView: UIViewRepresentable {
         mtkView.delegate = context.coordinator
         mtkView.backgroundColor = .black
         mtkView.isOpaque = true
-        mtkView.clearColor = MTLClearColor(red: 0.05, green: 0.07, blue: 0.1, alpha: 1.0)
+        mtkView.clearColor = MTLClearColor(red: 0.04, green: 0.06, blue: 0.09, alpha: 1.0)
         mtkView.colorPixelFormat = .bgra8Unorm
-        mtkView.preferredFramesPerSecond = perfManager.targetFPSLimit
+        mtkView.preferredFramesPerSecond = targetFPSLimit
         mtkView.isPaused = false
         mtkView.enableSetNeedsDisplay = false
+        mtkView.isUserInteractionEnabled = false
         return mtkView
     }
     
     func updateUIView(_ uiView: MTKView, context: Context) {
-        uiView.preferredFramesPerSecond = perfManager.targetFPSLimit
+        if uiView.preferredFramesPerSecond != targetFPSLimit {
+            uiView.preferredFramesPerSecond = targetFPSLimit
+        }
     }
     
     class Coordinator: NSObject, MTKViewDelegate {
         var parent: MetalViewportView
         var commandQueue: MTLCommandQueue?
-        private var frameCount: Int = 0
         
         init(_ parent: MetalViewportView) {
             self.parent = parent
@@ -54,26 +56,18 @@ struct MetalViewportView: UIViewRepresentable {
         func draw(in view: MTKView) {
             guard let drawable = view.currentDrawable,
                   let renderPassDescriptor = view.currentRenderPassDescriptor,
-                  let commandQueue = commandQueue else {
+                  let commandQueue = commandQueue,
+                  let commandBuffer = commandQueue.makeCommandBuffer() else {
                 return
             }
             
-            frameCount += 1
-            
-            // Subtle dynamic background pulse to visually verify active Metal GPU rendering pipeline
-            let time = Double(frameCount) * 0.02
-            let redPulse = 0.04 + sin(time) * 0.01
-            let bluePulse = 0.08 + cos(time) * 0.02
-            
-            renderPassDescriptor.colorAttachments[0].clearColor = MTLClearColor(
-                red: redPulse,
-                green: 0.06,
-                blue: bluePulse,
-                alpha: 1.0
+            // Invoke DXMT / Metal swapchain frame presentation hook in BramaCore (and libdxmt.dylib)
+            BramaCore.shared().presentDXMTFrame(
+                with: commandBuffer,
+                renderPassDescriptor: renderPassDescriptor
             )
             
-            guard let commandBuffer = commandQueue.makeCommandBuffer(),
-                  let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor) else {
+            guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor) else {
                 return
             }
             

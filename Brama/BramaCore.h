@@ -29,6 +29,9 @@ typedef void (^BramaLogCallback)(NSString *logMessage);
 @property (nonatomic, strong) NSArray<NSString *> *sectionNames;
 @property (nonatomic, strong) NSArray<NSString *> *importedDLLs;
 @property (nonatomic, strong) NSArray<NSString *> *importedSymbols;
+@property (nonatomic, strong) NSArray<NSString *> *exportedSymbols;
+@property (nonatomic, assign) uint32_t exportTableCount;
+@property (nonatomic, assign) uint32_t resolvedIATThunkCount;
 
 @end
 
@@ -42,6 +45,7 @@ typedef void (^BramaLogCallback)(NSString *logMessage);
 @property (nonatomic, assign) BOOL dxmtMetalLoaded;
 @property (nonatomic, copy) NSString *dxmtMetalModuleName;
 @property (nonatomic, copy) NSString *runtimeSearchPath;
+@property (nonatomic, assign) uint64_t framesPresented;
 
 @end
 
@@ -51,6 +55,9 @@ typedef void (^BramaLogCallback)(NSString *logMessage);
 
 /// Most recently mapped PE32/PE32+ executable metadata
 @property (nonatomic, strong, readonly, nullable) BramaPEExecutableInfo *lastLoadedExecutable;
+
+/// Dependent PE32/PE32+ DLL modules mapped alongside the main executable (e.g. UnityPlayer.dll)
+@property (nonatomic, strong, readonly) NSArray<BramaPEExecutableInfo *> *loadedDLLModules;
 
 /// Status of loaded dynamic translation libraries (.dylib)
 @property (nonatomic, strong, readonly) BramaRuntimeModulesStatus *runtimeStatus;
@@ -65,12 +72,20 @@ typedef void (^BramaLogCallback)(NSString *logMessage);
 - (void)attachMetalDevice:(nullable id<MTLDevice>)device
              commandQueue:(nullable id<MTLCommandQueue>)commandQueue;
 
+/// Invokes the DXMT / Metal swapchain presentation hook for the active frame
+- (void)presentDXMTFrameWithCommandBuffer:(nullable id<MTLCommandBuffer>)commandBuffer
+                     renderPassDescriptor:(nullable MTLRenderPassDescriptor *)renderPassDescriptor;
+
 /// Prepares the sandboxed Windows filesystem hierarchy (drive_c, windows, system32, runtime dylibs)
 - (BOOL)prepareWinePrefixAtPath:(NSString *)prefixPath error:(NSError **)error;
 
 /// Parses and maps a Windows PE32/PE32+ (.exe) binary into the iPad's virtual memory space
 - (nullable BramaPEExecutableInfo *)loadAndMapPEExecutableAtPath:(NSString *)executablePath
                                                      logCallback:(nullable BramaLogCallback)callback;
+
+/// Parses and maps a dependent Windows PE32/PE32+ (.dll) library and resolves its Export Directory Table
+- (nullable BramaPEExecutableInfo *)loadAndMapPEDLLAtPath:(NSString *)dllPath
+                                              logCallback:(nullable BramaLogCallback)callback;
 
 /// Probes and loads available Wine / Box64 / FEX-Emu / DXMT dynamic libraries via dlopen
 - (BramaRuntimeModulesStatus *)initializeEmulationSubsystemsWithPrefix:(NSString *)prefixPath

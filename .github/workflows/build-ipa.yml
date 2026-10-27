@@ -28,6 +28,11 @@ jobs:
           xcodebuild -version
           xcodebuild -showsdks
 
+      - name: Build Native iOS ARM64 Emulation Runtimes (libbox64 / libwine / libdxmt)
+        run: |
+          chmod +x scripts/build-runtime-dylibs.sh
+          ./scripts/build-runtime-dylibs.sh
+
       - name: Compile Brama (Release - iphoneos ARM64)
         run: |
           xcodebuild clean build \
@@ -49,6 +54,11 @@ jobs:
             echo "Error: Brama.app not found at $APP_PATH"
             exit 1
           fi
+
+          # Embed compiled ARM64 runtime dylibs inside Brama.app/Runtime
+          mkdir -p "$APP_PATH/Runtime"
+          cp -f RuntimeDylibs/*.dylib "$APP_PATH/Runtime/"
+          codesign --force --sign - --timestamp=none "$APP_PATH/Runtime/"*.dylib
 
           # Remove any residual _CodeSignature before applying ad-hoc entitlements
           rm -rf "$APP_PATH/_CodeSignature"
