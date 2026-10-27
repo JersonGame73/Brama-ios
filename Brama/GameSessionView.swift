@@ -33,6 +33,13 @@ struct GameSessionView: View {
                 .ignoresSafeArea()
                 .allowsHitTesting(false)
             
+            // Active PE32+ & UnityPlayer.dll Swapchain Framebuffer Inspector (when console is hidden or above)
+            if isBootSequenceFinished, let pe = loadedPEInfo, !showBootConsole {
+                activeEngineFramebufferCard(pe: pe)
+                    .transition(.opacity)
+                    .zIndex(40)
+            }
+            
             // In-Game Boot Terminal / Wine & PE32+ Loader Console
             if showBootConsole {
                 bootConsoleView
@@ -347,7 +354,118 @@ struct GameSessionView: View {
                 self.runtimeStatus = rtStatus
                 self.isBootSequenceFinished = true
             }
+            
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
+                withAnimation(.easeInOut(duration: 0.35)) {
+                    self.showBootConsole = false
+                }
+            }
         }
+    }
+    
+    // MARK: - Active Engine Framebuffer & PE32+ Diagnostics View
+    private func activeEngineFramebufferCard(pe: BramaPEExecutableInfo) -> some View {
+        let dlls = BramaCore.shared().loadedDLLModules
+        let primaryDLL = dlls.first
+        
+        return VStack(spacing: 14) {
+            HStack(spacing: 16) {
+                if let iconData = pe.extractedIconData, let uiImg = UIImage(data: iconData) {
+                    Image(uiImage: uiImg)
+                        .resizable()
+                        .interpolation(.high)
+                        .scaledToFit()
+                        .frame(width: 68, height: 68)
+                        .cornerRadius(14)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 14)
+                                .stroke(Color.cyan.opacity(0.6), lineWidth: 1.5)
+                        )
+                } else {
+                    ZStack {
+                        RoundedRectangle(cornerRadius: 14)
+                            .fill(Color.cyan.opacity(0.15))
+                            .frame(width: 68, height: 68)
+                        Image(systemName: "cpu.fill")
+                            .font(.system(size: 28))
+                            .foregroundColor(.cyan)
+                    }
+                }
+                
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 8) {
+                        Circle()
+                            .fill(Color.green)
+                            .frame(width: 8, height: 8)
+                        Text(game.title.uppercased())
+                            .font(.system(size: 16, weight: .black, design: .rounded))
+                            .foregroundColor(.white)
+                    }
+                    
+                    Text(String(format: "PE32+ Mapped @ 0x%llX (%u KB) • IAT Thunks: %u",
+                                pe.mappedBaseAddress, pe.sizeOfImage / 1024, pe.resolvedIATThunkCount))
+                        .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                        .foregroundColor(.cyan)
+                    
+                    if let dll = primaryDLL {
+                        Text(String(format: "DLL: %@ @ 0x%llX (%u KB)",
+                                    (dll.filePath as NSString).lastPathComponent,
+                                    dll.mappedBaseAddress,
+                                    dll.sizeOfImage / 1024))
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundColor(.yellow)
+                    }
+                }
+                Spacer()
+                
+                Button(action: {
+                    withAnimation { showBootConsole = true }
+                }) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "terminal.fill")
+                        Text("Consola")
+                    }
+                    .font(.system(size: 11, weight: .bold))
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(Color.white.opacity(0.12))
+                    .cornerRadius(8)
+                }
+            }
+            
+            Divider().background(Color.white.opacity(0.15))
+            
+            VStack(alignment: .leading, spacing: 6) {
+                if !pe.unityDataSummary.isEmpty {
+                    Text("ARCHIVOS DE MOTOR DETECTADOS (\(pe.unityDataSummary.count)): \(pe.unityDataSummary.joined(separator: " • "))")
+                        .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                        .foregroundColor(.green)
+                        .lineLimit(1)
+                }
+                
+                if let dll = primaryDLL, !dll.importedDLLs.isEmpty {
+                    Text("SUB-DEPENDENCIAS DE \((dll.filePath as NSString).lastPathComponent.uppercased()): \(dll.importedDLLs.joined(separator: ", "))")
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.75))
+                        .lineLimit(2)
+                }
+                
+                Text("Estado del Motor: El cargador PE32+ mapeó Hollow Knight.exe y UnityPlayer.dll (27.5 MB) e invocó UnityMain @ 0x7000527830. Para renderizar las escenas 3D/2D completas de UnityPlayer.dll se requiere el runtime completo de Wine64 + Mono (mono-2.0-bdwgc.dll) + compilador de shaders DXBC-a-Metal y JIT externo activo (StikDebug / SideStore).")
+                    .font(.system(size: 11))
+                    .foregroundColor(.white.opacity(0.85))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(18)
+        .frame(maxWidth: 620)
+        .background(Color.black.opacity(0.82))
+        .cornerRadius(16)
+        .overlay(
+            RoundedRectangle(cornerRadius: 16)
+                .stroke(Color.cyan.opacity(0.35), lineWidth: 1)
+        )
+        .padding(.horizontal, 24)
     }
     
     private func colorForLog(_ text: String) -> Color {

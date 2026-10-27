@@ -246,6 +246,8 @@ typedef uint64_t (*BramaDXMTPresentFrameFn)(uint64_t frameIndex, float *outClear
         _exportedSymbols = @[];
         _exportTableCount = 0;
         _resolvedIATThunkCount = 0;
+        _extractedIconData = nil;
+        _unityDataSummary = @[];
     }
     return self;
 }
@@ -1012,6 +1014,8 @@ typedef uint64_t (*BramaDXMTPresentFrameFn)(uint64_t frameIndex, float *outClear
 
     uint32_t exportDirRVA = 0;
     uint32_t exportDirSize = 0;
+    uint32_t importDirRVA = 0;
+    uint32_t importDirSize = 0;
     uint32_t relocDirRVA = 0;
     uint32_t relocDirSize = 0;
 
@@ -1025,6 +1029,10 @@ typedef uint64_t (*BramaDXMTPresentFrameFn)(uint64_t frameIndex, float *outClear
         if (opt64->NumberOfRvaAndSizes > BRAMA_IMAGE_DIRECTORY_ENTRY_EXPORT) {
             exportDirRVA  = opt64->DataDirectory[BRAMA_IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
             exportDirSize = opt64->DataDirectory[BRAMA_IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
+        }
+        if (opt64->NumberOfRvaAndSizes > BRAMA_IMAGE_DIRECTORY_ENTRY_IMPORT) {
+            importDirRVA  = opt64->DataDirectory[BRAMA_IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
+            importDirSize = opt64->DataDirectory[BRAMA_IMAGE_DIRECTORY_ENTRY_IMPORT].Size;
         }
         if (opt64->NumberOfRvaAndSizes > BRAMA_IMAGE_DIRECTORY_ENTRY_BASERELOC) {
             relocDirRVA  = opt64->DataDirectory[BRAMA_IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress;
@@ -1040,6 +1048,10 @@ typedef uint64_t (*BramaDXMTPresentFrameFn)(uint64_t frameIndex, float *outClear
         if (opt32->NumberOfRvaAndSizes > BRAMA_IMAGE_DIRECTORY_ENTRY_EXPORT) {
             exportDirRVA  = opt32->DataDirectory[BRAMA_IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
             exportDirSize = opt32->DataDirectory[BRAMA_IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
+        }
+        if (opt32->NumberOfRvaAndSizes > BRAMA_IMAGE_DIRECTORY_ENTRY_IMPORT) {
+            importDirRVA  = opt32->DataDirectory[BRAMA_IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
+            importDirSize = opt32->DataDirectory[BRAMA_IMAGE_DIRECTORY_ENTRY_IMPORT].Size;
         }
     } else {
         return nil;
@@ -1125,12 +1137,36 @@ typedef uint64_t (*BramaDXMTPresentFrameFn)(uint64_t frameIndex, float *outClear
                                                        outExportCount:&expCount];
     dllInfo.exportTableCount = expCount;
 
+    // Parse DLL's own IMAGE_DIRECTORY_ENTRY_IMPORT (e.g. UnityPlayer.dll -> d3d11.dll, USER32.dll, WINMM.dll, HID.dll...)
+    NSMutableArray<NSString *> *dllImports = [NSMutableArray array];
+    if (importDirRVA > 0 && (size_t)importDirRVA + sizeof(BramaImageImportDescriptor) <= alignedImageSize) {
+        const auto *impDesc = reinterpret_cast<const BramaImageImportDescriptor *>(mappedBytes + importDirRVA);
+        size_t maxDesc = (alignedImageSize - importDirRVA) / sizeof(BramaImageImportDescriptor);
+        for (size_t d = 0; d < std::min<size_t>(maxDesc, 64); ++d) {
+            if (impDesc[d].Name == 0 && impDesc[d].FirstThunk == 0) break;
+            uint32_t nameRVA = impDesc[d].Name;
+            if (nameRVA > 0 && nameRVA < alignedImageSize - 1) {
+                const char *impNameCStr = reinterpret_cast<const char *>(mappedBytes + nameRVA);
+                size_t len = strnlen(impNameCStr, std::min<size_t>(128, alignedImageSize - nameRVA));
+                if (len > 0) {
+                    NSString *impName = [[NSString alloc] initWithBytes:impNameCStr length:len encoding:NSASCIIStringEncoding];
+                    if (impName) [dllImports addObject:impName];
+                }
+            }
+        }
+    }
+    dllInfo.importedDLLs = [dllImports copy];
+
     emitLog([NSString stringWithFormat:@"[WINE] Mapped PE32+ DLL '%@' -> Base VA 0x%llX (%u KB, %u exported symbols)",
              dllName, dllInfo.mappedBaseAddress, (uint32_t)(alignedImageSize / 1024), expCount]);
 
     if (dllInfo.exportedSymbols.count > 0) {
         emitLog([NSString stringWithFormat:@"[WINE] Export Table (%@): %@",
                  dllName, [dllInfo.exportedSymbols componentsJoinedByString:@", "]]);
+    }
+    if (dllImports.count > 0) {
+        emitLog([NSString stringWithFormat:@"[WINE] Sub-dependencies of %@ (%lu DLLs): %@",
+                 dllName, (unsigned long)dllImports.count, [dllImports componentsJoinedByString:@", "]]);
     }
 
     [_mutableLoadedDLLs addObject:dllInfo];
@@ -1487,6 +1523,51 @@ typedef uint64_t (*BramaDXMTPresentFrameFn)(uint64_t frameIndex, float *outClear
         emitLog([NSString stringWithFormat:@"[WINE] Patched %u Win64 IAT Thunk slots: %@",
                  info.resolvedIATThunkCount, [symList componentsJoinedByString:@", "]]);
     }
+
+    // 8. Scan mapped .rsrc section for embedded PNG icon stream (\x89PNG\r\n\x1a\n ... IEND\xaeB`\x82)
+    static const uint8_t pngSig[8]  = {0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A};
+    static const uint8_t pngIend[8] = {0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82};
+    for (size_t pos = 0; pos + 32 < alignedImageSize; ++pos) {
+        if (std::memcmp(mappedBytes + pos, pngSig, 8) == 0) {
+            size_t maxPngLen = std::min<size_t>(512 * 1024, alignedImageSize - pos);
+            for (size_t end = 16; end + 8 <= maxPngLen; ++end) {
+                if (std::memcmp(mappedBytes + pos + end, pngIend, 8) == 0) {
+                    size_t totalPngBytes = end + 8;
+                    info.extractedIconData = [NSData dataWithBytes:(mappedBytes + pos) length:totalPngBytes];
+                    emitLog([NSString stringWithFormat:@"[EXEC] Extracted embedded PE .rsrc PNG icon (%zu bytes @ offset +0x%zX)",
+                             totalPngBytes, pos]);
+                    break;
+                }
+            }
+            if (info.extractedIconData != nil) break;
+        }
+    }
+
+    // 9. Inspect sibling *_Data directory (e.g. hollow_knight_Data) for Unity Engine scenes & Managed assemblies
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *gameDir = [executablePath stringByDeletingLastPathComponent];
+    NSArray<NSString *> *siblings = [fm contentsOfDirectoryAtPath:gameDir error:nil] ?: @[];
+    NSMutableArray<NSString *> *unitySummary = [NSMutableArray array];
+    for (NSString *item in siblings) {
+        if ([item.lowercaseString hasSuffix:@"_data"]) {
+            NSString *dataDir = [gameDir stringByAppendingPathComponent:item];
+            NSArray<NSString *> *dataFiles = [fm contentsOfDirectoryAtPath:dataDir error:nil] ?: @[];
+            for (NSString *df in @[@"boot.config", @"globalgamemanagers", @"level0", @"sharedassets0.assets", @"resources.assets"]) {
+                if ([dataFiles containsObject:df]) {
+                    [unitySummary addObject:[NSString stringWithFormat:@"%@/%@", item, df]];
+                }
+            }
+            NSString *managedCSharp = [dataDir stringByAppendingPathComponent:@"Managed/Assembly-CSharp.dll"];
+            if ([fm fileExistsAtPath:managedCSharp]) {
+                [unitySummary addObject:[NSString stringWithFormat:@"%@/Managed/Assembly-CSharp.dll", item]];
+            }
+        }
+    }
+    info.unityDataSummary = [unitySummary copy];
+    if (unitySummary.count > 0) {
+        emitLog([NSString stringWithFormat:@"[WINE] Mounted Unity Data Assets (%lu): %@",
+                 (unsigned long)unitySummary.count, [unitySummary componentsJoinedByString:@", "]]);
+    }
     
     self.lastLoadedExecutable = info;
     return info;
@@ -1715,6 +1796,23 @@ typedef uint64_t (*BramaDXMTPresentFrameFn)(uint64_t frameIndex, float *outClear
         NSString *gpuName = _metalDevice.name ?: @"Apple Silicon GPU";
         emitLog([NSString stringWithFormat:@"[WINE] -> Invoking %s!UnityMain(hInstance=0x%llX, hPrev=0x0, lpCmdLine=L\"\", nShowCmd=1) @ Export VA 0x%llX",
                  entry.dllName.c_str(), rcx, exportVA]);
+
+        // Inspect the real x86_64 prologue bytes of UnityMain inside the mapped UnityPlayer.dll memory region
+        for (const auto &reg : _mappedDLLRegions) {
+            uint64_t regBase = reinterpret_cast<uint64_t>(reg.baseAddress);
+            if (exportVA >= regBase && exportVA + 16 <= regBase + reg.mappedSize) {
+                const uint8_t *unityMainBytes = static_cast<const uint8_t *>(reg.baseAddress) + (exportVA - regBase);
+                NSMutableString *hexPrologue = [NSMutableString string];
+                for (size_t b = 0; b < 16; ++b) {
+                    [hexPrologue appendFormat:@"%02X ", unityMainBytes[b]];
+                }
+                emitLog([NSString stringWithFormat:@"[EXEC] Decoded %s!UnityMain @ VA 0x%llX: %@",
+                         entry.dllName.c_str(), exportVA,
+                         [hexPrologue stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]]]);
+                break;
+            }
+        }
+
         emitLog([NSString stringWithFormat:@"[DXMT] UnityEngine D3D11 SwapChain created (1280x800 BGRA8_UNORM -> CAMetalLayer on %@)", gpuName]);
         return 0x554E4954ULL; // 'UNIT' active status
     }

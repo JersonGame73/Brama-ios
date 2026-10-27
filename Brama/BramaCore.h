@@ -32,6 +32,8 @@ typedef void (^BramaLogCallback)(NSString *logMessage);
 @property (nonatomic, strong) NSArray<NSString *> *exportedSymbols;
 @property (nonatomic, assign) uint32_t exportTableCount;
 @property (nonatomic, assign) uint32_t resolvedIATThunkCount;
+@property (nonatomic, strong, nullable) NSData *extractedIconData;
+@property (nonatomic, strong) NSArray<NSString *> *unityDataSummary;
 
 @end
 
