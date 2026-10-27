@@ -363,39 +363,44 @@ struct GameSessionView: View {
         .cornerRadius(6)
     }
     
-    // MARK: - Boot Simulation Engine
+    // MARK: - Boot Execution Engine
     private func startBootSequence() {
         bootLogs.removeAll()
         
-        let prefixURL = GameStorageManager.shared.winePrefixesDirectory
-            .appendingPathComponent(game.winePrefixName)
-            .path
-        
-        // 1. Invoke native C++ BramaCore
-        bootLogs.append("[BRAMA] Initializing Apple Silicon Metal GPU viewport...")
-        bootLogs.append("[BRAMA] Target resolution: \(game.screenResolution) • Scaling: \(game.scalingMode)")
-        
-        let jitAvailable = BramaCore.shared().isJITAvailable()
-        perfManager.isJITEnabled = jitAvailable
-        bootLogs.append("[JIT] Dynamic code generation: \(jitAvailable ? "GRANTED (Active JIT)" : "RESTRICTED (Interpreter)")")
-        
-        _ = BramaCore.shared().launchExecutable(
-            atPath: game.executablePath,
-            prefixPath: prefixURL,
-            arguments: game.launchArguments
-        ) { log in
+        DispatchQueue.global(qos: .userInitiated).async {
+            let prefixURL = GameStorageManager.shared.winePrefixesDirectory
+                .appendingPathComponent(self.game.winePrefixName)
+                .path
+            
             DispatchQueue.main.async {
-                self.bootLogs.append(log)
+                self.bootLogs.append("[BRAMA] Initializing Apple Silicon Metal GPU viewport...")
+                self.bootLogs.append("[BRAMA] Target resolution: \(self.game.screenResolution) • Scaling: \(self.game.scalingMode)")
             }
-        }
-        
-        // 2. Transition to active game render canvas
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
-            self.bootLogs.append("[BRAMA] Render loop successfully attached. Handheld controls ready.")
-            self.isBootSequenceFinished = true
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
-                withAnimation {
-                    self.showBootConsole = false
+            
+            let jitAvailable = BramaCore.shared().isJITAvailable()
+            
+            DispatchQueue.main.async {
+                self.perfManager.isJITEnabled = jitAvailable
+                self.bootLogs.append("[JIT] Dynamic code generation: \(jitAvailable ? "GRANTED (Active JIT)" : "RESTRICTED (Interpreter)")")
+            }
+            
+            _ = BramaCore.shared().launchExecutable(
+                atPath: self.game.executablePath,
+                prefixPath: prefixURL,
+                arguments: self.game.launchArguments
+            ) { log in
+                DispatchQueue.main.async {
+                    self.bootLogs.append(log)
+                }
+            }
+            
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.8) {
+                self.bootLogs.append("[BRAMA] Render loop successfully attached. Handheld controls ready.")
+                self.isBootSequenceFinished = true
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
+                    withAnimation {
+                        self.showBootConsole = false
+                    }
                 }
             }
         }

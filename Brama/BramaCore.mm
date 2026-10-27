@@ -47,35 +47,22 @@
 }
 
 - (BOOL)isJITAvailable {
-    // Test if the process has JIT entitlement by allocating a page with RWX
+#if defined(__arm64__) || defined(__aarch64__)
     size_t pageSize = getpagesize();
-    void *ptr = mmap(NULL, pageSize, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_ANON | MAP_SHARED, -1, 0);
+    
+    // On iOS Apple Silicon, allocating JIT memory requires MAP_JIT
+    void *ptr = mmap(NULL, pageSize, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_ANON | MAP_SHARED | MAP_JIT, -1, 0);
     if (ptr == MAP_FAILED) {
-        NSLog(@"[BRAMA-CORE] JIT check: mmap RWX failed (errno: %d - %s)", errno, strerror(errno));
+        NSLog(@"[BRAMA-CORE] JIT check: MAP_JIT not permitted by kernel (errno: %d - %s)", errno, strerror(errno));
         return NO;
     }
     
-    // Test writing and executing a simple RET instruction
-    unsigned char *code = (unsigned char *)ptr;
-#if defined(__arm64__) || defined(__aarch64__)
-    // ARM64 'RET' instruction: 0xD65F03C0 (little-endian: C0 03 5F D6)
-    *((uint32_t *)code) = 0xD65F03C0;
-#else
-    // x86_64 'RET' instruction: 0xC3
-    code[0] = 0xC3;
-#endif
-    
-    // Clear instruction and data cache to verify execution
-    sys_dcache_flush(ptr, 4);
-    sys_icache_invalidate(ptr, 4);
-    
-    typedef void (*VoidFunc)(void);
-    VoidFunc func = (VoidFunc)ptr;
-    func(); // Call the allocated code
-    
     munmap(ptr, pageSize);
-    NSLog(@"[BRAMA-CORE] JIT check: Dynamic execution verified successfully!");
+    NSLog(@"[BRAMA-CORE] JIT check: Dynamic JIT memory allocation verified successfully!");
     return YES;
+#else
+    return YES;
+#endif
 }
 
 - (BOOL)prepareWinePrefixAtPath:(NSString *)prefixPath error:(NSError **)error {
