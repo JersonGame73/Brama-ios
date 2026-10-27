@@ -1200,12 +1200,40 @@ struct BramaImageBaseRelocation {
         return NO;
     }
     
+    // 3. Verify non-system dependent DLLs (e.g. UnityPlayer.dll) in the game directory
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *gameDir = [resolvedExePath stringByDeletingLastPathComponent];
+    NSSet<NSString *> *systemDLLs = [NSSet setWithObjects:
+        @"kernel32.dll", @"user32.dll", @"gdi32.dll", @"advapi32.dll",
+        @"shell32.dll", @"ole32.dll", @"oleaut32.dll", @"msvcrt.dll",
+        @"ntdll.dll", @"ws2_32.dll", @"d3d11.dll", @"d3d12.dll",
+        @"dxgi.dll", @"version.dll", @"winmm.dll", @"imm32.dll", nil];
+    
+    for (NSString *dll in peInfo.importedDLLs) {
+        if (![systemDLLs containsObject:dll.lowercaseString]) {
+            NSString *dllPath = [gameDir stringByAppendingPathComponent:dll];
+            if ([fm fileExistsAtPath:dllPath]) {
+                NSDictionary *attrs = [fm attributesOfItemAtPath:dllPath error:nil];
+                unsigned long long dllSizeKB = [attrs fileSize] / 1024;
+                emitLog([NSString stringWithFormat:@"[WINE] Found game module %@ (%llu KB) in container.", dll, dllSizeKB]);
+            } else {
+                emitLog([NSString stringWithFormat:@"[WINE] ⚠️ MISSING GAME MODULE: '%@' not found next to %@!",
+                         dll, [resolvedExePath lastPathComponent]]);
+                emitLog(@"[WINE] ⚠️ Import the complete game folder (with UnityPlayer.dll and *_Data), not only the .exe file.");
+            }
+        }
+    }
+    
     if (arguments.length > 0) {
         emitLog([NSString stringWithFormat:@"[WINE] Passing launch arguments: %@", arguments]);
     }
     
-    // 3. Translate and execute the PE entry point block
+    // 4. Translate and execute the PE entry point block
     [self executeTranslatedEntryPointForPE:peInfo jitEnabled:jit logCallback:callback];
+    
+    if (!_wineLibraryHandle || !_cpuTranslatorHandle) {
+        emitLog(@"[BRAMA] Notice: External libwine.dylib / libbox64.dylib / libdxmt.dylib not found in Documents/BramaRuntime/lib.");
+    }
     
     _isRunning = YES;
     return YES;
