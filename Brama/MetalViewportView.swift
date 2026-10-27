@@ -19,6 +19,8 @@ struct MetalViewportView: UIViewRepresentable {
         let mtkView = MTKView()
         mtkView.device = MTLCreateSystemDefaultDevice()
         mtkView.delegate = context.coordinator
+        mtkView.backgroundColor = .black
+        mtkView.isOpaque = true
         mtkView.clearColor = MTLClearColor(red: 0.05, green: 0.07, blue: 0.1, alpha: 1.0)
         mtkView.colorPixelFormat = .bgra8Unorm
         mtkView.preferredFramesPerSecond = perfManager.targetFPSLimit

@@ -19,17 +19,31 @@ struct GameSessionView: View {
     @State private var isBootSequenceFinished: Bool = false
     @State private var showInGameMenu: Bool = false
     @State private var showBootConsole: Bool = true
+    @State private var frameCounter: Int = 0
+    
+    private let renderTimer = Timer.publish(every: 1.0 / 60.0, on: .main, in: .common).autoconnect()
     
     var body: some View {
         ZStack {
-            // Fullscreen Metal Canvas (GPU Rendering)
+            // Absolute Solid Black Background (Prevents any white flash in Light Mode)
+            Color.black
+                .ignoresSafeArea()
+            
+            // Fullscreen Metal Canvas (GPU Rendering via Apple MetalKit)
             MetalViewportView()
                 .ignoresSafeArea()
+            
+            // Virtual Game Display Screen (Active when boot finishes)
+            if isBootSequenceFinished {
+                virtualGameScreenView
+                    .transition(.opacity)
+            }
             
             // In-Game Boot Terminal / Loader Console
             if showBootConsole {
                 bootConsoleView
                     .transition(.opacity)
+                    .zIndex(50)
             }
             
             // In-Game MangoHUD (Top Left)
@@ -39,64 +53,133 @@ struct GameSessionView: View {
                         inGameHUD
                         Spacer()
                     }
-                    .padding(.top, 16)
+                    .padding(.top, 14)
                     .padding(.leading, 20)
                     Spacer()
                 }
                 .allowsHitTesting(false)
+                .zIndex(60)
             }
             
-            // Top Quick Pause / Steam Button (Handheld friendly)
+            // Top-Center Floating Pause Island (Never overlaps with side bumpers!)
             VStack {
                 HStack {
                     Spacer()
-                    
                     Button(action: {
                         withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
                             showInGameMenu.toggle()
                         }
                     }) {
-                        HStack(spacing: 6) {
+                        HStack(spacing: 8) {
                             Image(systemName: "pause.fill")
-                                .font(.system(size: 12, weight: .bold))
-                            Text("BRAMA MENÚ")
+                                .font(.system(size: 11, weight: .black))
+                            Text("MENÚ DE PAUSA")
                                 .font(.system(size: 11, weight: .black, design: .rounded))
                         }
                         .foregroundColor(.white)
-                        .padding(.horizontal, 12)
+                        .padding(.horizontal, 16)
                         .padding(.vertical, 7)
-                        .background(Color.black.opacity(0.65))
-                        .cornerRadius(16)
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 16)
-                                .stroke(Color.white.opacity(0.2), lineWidth: 1)
+                        .background(
+                            Capsule()
+                                .fill(Color.black.opacity(0.85))
                         )
+                        .overlay(
+                            Capsule()
+                                .stroke(Color(red: 0.1, green: 0.62, blue: 1.0).opacity(0.8), lineWidth: 1.5)
+                        )
+                        .shadow(color: .black.opacity(0.5), radius: 6, x: 0, y: 3)
                     }
-                    .padding(.top, 16)
-                    .padding(.trailing, 20)
+                    Spacer()
                 }
+                .padding(.top, 10)
+                
                 Spacer()
             }
+            .zIndex(100)
             
             // Touch Gamepad Controls Overlay
             if controllerManager.showVirtualTouchControls {
-                VirtualGamepadOverlayView()
+                VirtualGamepadOverlayView(onMenuPressed: {
+                    withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+                        showInGameMenu = true
+                    }
+                })
+                .zIndex(80)
             }
             
             // In-Game Pause Modal
             if showInGameMenu {
-                Color.black.opacity(0.6)
+                Color.black.opacity(0.65)
                     .ignoresSafeArea()
                     .onTapGesture {
                         withAnimation { showInGameMenu = false }
                     }
+                    .zIndex(110)
                 
                 inGamePauseDialog
                     .transition(.scale(scale: 0.95).combined(with: .opacity))
+                    .zIndex(120)
             }
         }
+        .preferredColorScheme(.dark)
+        .statusBarHidden(true)
+        .persistentSystemOverlays(.hidden)
         .onAppear {
             startBootSequence()
+        }
+        .onReceive(renderTimer) { _ in
+            frameCounter += 1
+        }
+    }
+    
+    // MARK: - Virtual Game Screen Display
+    private var virtualGameScreenView: some View {
+        ZStack {
+            // Game Artwork Canvas
+            RoundedRectangle(cornerRadius: 12)
+                .fill(
+                    LinearGradient(
+                        colors: game.bannerGradient,
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                )
+                .aspectRatio(16/10, contentMode: .fit)
+                .overlay(
+                    // Scanline / CRT effect
+                    VStack(spacing: 4) {
+                        ForEach(0..<40, id: \.self) { _ in
+                            Divider()
+                                .background(Color.black.opacity(0.12))
+                        }
+                    }
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 12)
+                        .stroke(Color.white.opacity(0.2), lineWidth: 1)
+                )
+                .padding(24)
+            
+            // In-Game Center Title & Render Status
+            VStack(spacing: 8) {
+                Text(game.title)
+                    .font(.system(size: 32, weight: .heavy, design: .rounded))
+                    .foregroundColor(.white)
+                    .shadow(color: .black.opacity(0.8), radius: 8, x: 0, y: 4)
+                
+                HStack(spacing: 8) {
+                    Circle()
+                        .fill(Color.green)
+                        .frame(width: 8, height: 8)
+                    Text("VENTANA ACTIVA • \(game.screenResolution)")
+                        .font(.system(size: 12, weight: .bold, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.9))
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 5)
+                .background(Color.black.opacity(0.65))
+                .cornerRadius(12)
+            }
         }
     }
     
@@ -116,7 +199,7 @@ struct GameSessionView: View {
                 Button(action: {
                     withAnimation { showBootConsole = false }
                 }) {
-                    Text(isBootSequenceFinished ? "Ocultar Consola" : "Minimizar")
+                    Text(isBootSequenceFinished ? "Cerrar Consola" : "Minimizar")
                         .font(.system(size: 11, weight: .bold))
                         .foregroundColor(.cyan)
                 }
@@ -145,11 +228,11 @@ struct GameSessionView: View {
             .frame(height: 140)
         }
         .padding(14)
-        .background(Color.black.opacity(0.85))
+        .background(Color.black.opacity(0.88))
         .cornerRadius(12)
         .overlay(
             RoundedRectangle(cornerRadius: 12)
-                .stroke(Color.white.opacity(0.2), lineWidth: 1)
+                .stroke(Color.white.opacity(0.25), lineWidth: 1)
         )
         .frame(maxWidth: 520)
         .padding(.horizontal, 24)
@@ -287,7 +370,6 @@ struct GameSessionView: View {
                 self.bootLogs.append(log)
                 if delay >= 3.5 {
                     self.isBootSequenceFinished = true
-                    // Auto-hide console after 5 seconds of gameplay
                     DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
                         withAnimation {
                             self.showBootConsole = false

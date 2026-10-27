@@ -134,6 +134,9 @@ struct ContentView: View {
         .fullScreenCover(isPresented: $isGameRunning) {
             GameSessionView(game: selectedGame)
         }
+        .preferredColorScheme(.dark)
+        .statusBarHidden(true)
+        .persistentSystemOverlays(.hidden)
     }
     
     // MARK: - Top Navigation Bar

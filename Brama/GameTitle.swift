@@ -217,7 +217,7 @@ extension GameTitle {
             hoursPlayed: 56.8,
             lastPlayedText: "Hace 2 semanas",
             colorHexes: ["#B3661A", "#33260D"],
-            systemIcon: "radiation",
+            systemIcon: "atom",
             compatibility: .verified,
             targetFPS: 60,
             executablePath: "C:\\Games\\Fallout New Vegas\\FalloutNV.exe"
