@@ -131,12 +131,8 @@ struct ContentView: View {
         .sheet(isPresented: $showAddGameModal) {
             AddGameView()
         }
-        .alert(isPresented: $isGameRunning) {
-            Alert(
-                title: Text("Iniciando \(selectedGame.title)"),
-                message: Text("Motor: \(selectedGame.translationEngine.rawValue)\nGráficos: \(selectedGame.graphicsBackend.rawValue)\nResolución: \(selectedGame.screenResolution)\nEjecutable: \(selectedGame.executablePath)\nJIT: \(perfManager.isJITEnabled ? "Habilitado" : "Deshabilitado")"),
-                dismissButton: .default(Text("Entendido"))
-            )
+        .fullScreenCover(isPresented: $isGameRunning) {
+            GameSessionView(game: selectedGame)
         }
     }
     

@@ -1,0 +1,308 @@
+//
+//  GameSessionView.swift
+//  Brama
+//
+//  Created by Gerson Larrahondo on 27/10/26.
+//
+
+import SwiftUI
+import Combine
+
+struct GameSessionView: View {
+    let game: GameTitle
+    @Environment(\.dismiss) private var dismiss
+    
+    @ObservedObject var perfManager = PerformanceManager.shared
+    @ObservedObject var controllerManager = ControllerManager.shared
+    
+    @State private var bootLogs: [String] = []
+    @State private var isBootSequenceFinished: Bool = false
+    @State private var showInGameMenu: Bool = false
+    @State private var showBootConsole: Bool = true
+    
+    var body: some View {
+        ZStack {
+            // Fullscreen Metal Canvas (GPU Rendering)
+            MetalViewportView()
+                .ignoresSafeArea()
+            
+            // In-Game Boot Terminal / Loader Console
+            if showBootConsole {
+                bootConsoleView
+                    .transition(.opacity)
+            }
+            
+            // In-Game MangoHUD (Top Left)
+            if perfManager.overlayLevel != .off {
+                VStack {
+                    HStack {
+                        inGameHUD
+                        Spacer()
+                    }
+                    .padding(.top, 16)
+                    .padding(.leading, 20)
+                    Spacer()
+                }
+                .allowsHitTesting(false)
+            }
+            
+            // Top Quick Pause / Steam Button (Handheld friendly)
+            VStack {
+                HStack {
+                    Spacer()
+                    
+                    Button(action: {
+                        withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+                            showInGameMenu.toggle()
+                        }
+                    }) {
+                        HStack(spacing: 6) {
+                            Image(systemName: "pause.fill")
+                                .font(.system(size: 12, weight: .bold))
+                            Text("BRAMA MENÚ")
+                                .font(.system(size: 11, weight: .black, design: .rounded))
+                        }
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 7)
+                        .background(Color.black.opacity(0.65))
+                        .cornerRadius(16)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 16)
+                                .stroke(Color.white.opacity(0.2), lineWidth: 1)
+                        )
+                    }
+                    .padding(.top, 16)
+                    .padding(.trailing, 20)
+                }
+                Spacer()
+            }
+            
+            // Touch Gamepad Controls Overlay
+            if controllerManager.showVirtualTouchControls {
+                VirtualGamepadOverlayView()
+            }
+            
+            // In-Game Pause Modal
+            if showInGameMenu {
+                Color.black.opacity(0.6)
+                    .ignoresSafeArea()
+                    .onTapGesture {
+                        withAnimation { showInGameMenu = false }
+                    }
+                
+                inGamePauseDialog
+                    .transition(.scale(scale: 0.95).combined(with: .opacity))
+            }
+        }
+        .onAppear {
+            startBootSequence()
+        }
+    }
+    
+    // MARK: - Boot Console View
+    private var bootConsoleView: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Circle()
+                    .fill(Color.green)
+                    .frame(width: 8, height: 8)
+                Text("Brama Execution Runtime • \(game.title)")
+                    .font(.system(size: 12, weight: .bold, design: .monospaced))
+                    .foregroundColor(.white)
+                
+                Spacer()
+                
+                Button(action: {
+                    withAnimation { showBootConsole = false }
+                }) {
+                    Text(isBootSequenceFinished ? "Ocultar Consola" : "Minimizar")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundColor(.cyan)
+                }
+            }
+            .padding(.bottom, 4)
+            
+            Divider()
+                .background(Color.white.opacity(0.2))
+            
+            ScrollViewReader { proxy in
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 4) {
+                        ForEach(0..<bootLogs.count, id: \.self) { index in
+                            Text(bootLogs[index])
+                                .font(.system(size: 11, design: .monospaced))
+                                .foregroundColor(colorForLog(bootLogs[index]))
+                                .id(index)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .onChange(of: bootLogs.count) { count in
+                    proxy.scrollTo(count - 1, anchor: .bottom)
+                }
+            }
+            .frame(height: 140)
+        }
+        .padding(14)
+        .background(Color.black.opacity(0.85))
+        .cornerRadius(12)
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(Color.white.opacity(0.2), lineWidth: 1)
+        )
+        .frame(maxWidth: 520)
+        .padding(.horizontal, 24)
+    }
+    
+    // MARK: - In-Game Pause Dialog
+    private var inGamePauseDialog: some View {
+        VStack(spacing: 20) {
+            VStack(spacing: 4) {
+                Text(game.title)
+                    .font(.system(size: 20, weight: .heavy, design: .rounded))
+                    .foregroundColor(.white)
+                Text("Partida en Pausa")
+                    .font(.system(size: 13))
+                    .foregroundColor(.gray)
+            }
+            
+            VStack(spacing: 12) {
+                Button(action: {
+                    withAnimation { showInGameMenu = false }
+                }) {
+                    HStack {
+                        Image(systemName: "play.fill")
+                        Text("Continuar Jugando")
+                    }
+                    .font(.system(size: 14, weight: .bold))
+                    .foregroundColor(.white)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 12)
+                    .background(Color(red: 0.1, green: 0.62, blue: 1.0))
+                    .cornerRadius(10)
+                }
+                
+                Button(action: {
+                    withAnimation {
+                        showBootConsole.toggle()
+                        showInGameMenu = false
+                    }
+                }) {
+                    HStack {
+                        Image(systemName: "terminal.fill")
+                        Text(showBootConsole ? "Ocultar Consola de Wine" : "Ver Consola de Wine / Logs")
+                    }
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(.white.opacity(0.9))
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 11)
+                    .background(Color.white.opacity(0.08))
+                    .cornerRadius(10)
+                }
+                
+                Button(action: {
+                    dismiss()
+                }) {
+                    HStack {
+                        Image(systemName: "xmark.circle.fill")
+                        Text("Salir al Menú Principal")
+                    }
+                    .font(.system(size: 14, weight: .bold))
+                    .foregroundColor(.red)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 12)
+                    .background(Color.red.opacity(0.12))
+                    .cornerRadius(10)
+                }
+            }
+        }
+        .padding(24)
+        .frame(width: 320)
+        .background(Color(red: 0.1, green: 0.13, blue: 0.18).opacity(0.96))
+        .cornerRadius(18)
+        .overlay(
+            RoundedRectangle(cornerRadius: 18)
+                .stroke(Color.white.opacity(0.15), lineWidth: 1)
+        )
+    }
+    
+    // MARK: - In-Game HUD
+    private var inGameHUD: some View {
+        HStack(spacing: 12) {
+            HStack(spacing: 4) {
+                Text("FPS")
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundColor(.gray)
+                Text(String(format: "%.1f", perfManager.currentFPS))
+                    .font(.system(size: 12, weight: .heavy, design: .monospaced))
+                    .foregroundColor(.green)
+            }
+            
+            HStack(spacing: 4) {
+                Text("GPU")
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundColor(.gray)
+                Text("\(perfManager.gpuUtilizationPercent)%")
+                    .font(.system(size: 12, weight: .bold, design: .monospaced))
+                    .foregroundColor(.white)
+            }
+            
+            HStack(spacing: 4) {
+                Text("RES")
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundColor(.gray)
+                Text(game.screenResolution.prefix(8))
+                    .font(.system(size: 11, weight: .bold, design: .monospaced))
+                    .foregroundColor(.cyan)
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 4)
+        .background(Color.black.opacity(0.75))
+        .cornerRadius(6)
+    }
+    
+    // MARK: - Boot Simulation Engine
+    private func startBootSequence() {
+        bootLogs.removeAll()
+        
+        let steps: [(String, Double)] = [
+            ("[BRAMA] Initializing Apple Silicon Metal GPU viewport...", 0.1),
+            ("[BRAMA] Target resolution: \(game.screenResolution) • Scaling: \(game.scalingMode)", 0.3),
+            ("[JIT] Checking dynamic code generation entitlements...", 0.6),
+            ("[JIT] Memory page RWX allocation: GRANTED (Active JIT)", 0.9),
+            ("[WINE] Mounting sandboxed prefix ~/Documents/WinePrefixes/\(game.winePrefixName)...", 1.2),
+            ("[WINE] Mapping drive_c to local iOS sandbox.", 1.5),
+            ("[CPU] Loading translation engine: \(game.translationEngine.rawValue)", 1.8),
+            ("[GRAPHICS] Loading \(game.graphicsBackend.rawValue) translation pipeline...", 2.2),
+            ("[DXMT] Creating Metal device context and render command buffer...", 2.5),
+            ("[EXEC] Spawning Windows PE binary: \(game.executablePath)", 2.8),
+            ("[EXEC] Passing arguments: \(game.launchArguments.isEmpty ? "(none)" : game.launchArguments)", 3.1),
+            ("[BRAMA] Render loop successfully attached. Handheld controls ready.", 3.5)
+        ]
+        
+        for (log, delay) in steps {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                self.bootLogs.append(log)
+                if delay >= 3.5 {
+                    self.isBootSequenceFinished = true
+                    // Auto-hide console after 5 seconds of gameplay
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
+                        withAnimation {
+                            self.showBootConsole = false
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    private func colorForLog(_ text: String) -> Color {
+        if text.contains("[JIT]") { return .green }
+        if text.contains("[GRAPHICS]") || text.contains("[DXMT]") { return .cyan }
+        if text.contains("[WINE]") { return .yellow }
+        if text.contains("[EXEC]") { return .orange }
+        return .white.opacity(0.85)
+    }
+}
