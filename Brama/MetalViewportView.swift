@@ -6,74 +6,111 @@
 //
 
 import SwiftUI
-import MetalKit
+import UIKit
+import Metal
+import QuartzCore
+
+/// Persistent CAMetalLayer-backed view owned by DXMT (DirectX 11/12) and Winios (GDI/Desktop).
+/// Unlike MTKView, it never clears or overwrites drawables on a host timer, allowing the guest
+/// Wine / DXMT swapchain thread to call `nextDrawable` and present directly to the screen.
+final class BramaMetalSurfaceView: UIView {
+    override class var layerClass: AnyClass {
+        CAMetalLayer.self
+    }
+
+    var metalLayer: CAMetalLayer {
+        // swiftlint:disable:next force_cast
+        layer as! CAMetalLayer
+    }
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        configureMetalSurface()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        configureMetalSurface()
+    }
+
+    private func configureMetalSurface() {
+        backgroundColor = .black
+        isOpaque = true
+        isUserInteractionEnabled = true
+        isMultipleTouchEnabled = false
+
+        let device = MTLCreateSystemDefaultDevice()
+        let queue = device?.makeCommandQueue()
+        BramaCore.shared().attachMetalDevice(device, commandQueue: queue)
+
+        metalLayer.device = device
+        metalLayer.pixelFormat = .bgra8Unorm
+        metalLayer.framebufferOnly = false
+        metalLayer.presentsWithTransaction = false
+        metalLayer.contentsGravity = .resizeAspect
+        metalLayer.backgroundColor = UIColor.black.cgColor
+        // Initial 720p drawable size; DXMT / Winios resizes it when the game creates its swapchain
+        metalLayer.drawableSize = CGSize(width: 1280, height: 720)
+
+        BramaCore.shared().registerDisplay(metalLayer)
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        guard bounds.width > 1, bounds.height > 1 else { return }
+        BramaCore.shared().registerDisplay(metalLayer)
+        BramaCore.shared().updateViewportFrame(bounds, desktopRect: bounds)
+    }
+
+    private func guestCoordinates(for touch: UITouch) -> (Int32, Int32) {
+        let pt = touch.location(in: self)
+        let viewW = max(1.0, bounds.width)
+        let viewH = max(1.0, bounds.height)
+        let guestSize = BramaCore.shared().guestScreenSize()
+        let guestW = guestSize.width > 0 ? guestSize.width : 1280.0
+        let guestH = guestSize.height > 0 ? guestSize.height : 720.0
+
+        let rawX = Int32((pt.x / viewW) * guestW)
+        let rawY = Int32((pt.y / viewH) * guestH)
+        let clampedX = max(0, min(Int32(guestW) - 1, rawX))
+        let clampedY = max(0, min(Int32(guestH) - 1, rawY))
+        return (clampedX, clampedY)
+    }
+
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard let touch = touches.first else { return }
+        let (gx, gy) = guestCoordinates(for: touch)
+        BramaCore.shared().postTouchDownAt(x: gx, y: gy)
+    }
+
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard let touch = touches.first else { return }
+        let (gx, gy) = guestCoordinates(for: touch)
+        BramaCore.shared().postTouchMoveAt(x: gx, y: gy)
+    }
+
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard let touch = touches.first else { return }
+        let (gx, gy) = guestCoordinates(for: touch)
+        BramaCore.shared().postTouchUpAt(x: gx, y: gy)
+    }
+
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard let touch = touches.first else { return }
+        let (gx, gy) = guestCoordinates(for: touch)
+        BramaCore.shared().postTouchUpAt(x: gx, y: gy)
+    }
+}
 
 struct MetalViewportView: UIViewRepresentable {
     var targetFPSLimit: Int = 60
-    
-    func makeCoordinator() -> Coordinator {
-        Coordinator(self)
+
+    func makeUIView(context: Context) -> BramaMetalSurfaceView {
+        let view = BramaMetalSurfaceView(frame: .zero)
+        return view
     }
-    
-    func makeUIView(context: Context) -> MTKView {
-        let mtkView = MTKView()
-        mtkView.device = MTLCreateSystemDefaultDevice()
-        mtkView.delegate = context.coordinator
-        mtkView.backgroundColor = .black
-        mtkView.isOpaque = true
-        mtkView.clearColor = MTLClearColor(red: 0.04, green: 0.06, blue: 0.09, alpha: 1.0)
-        mtkView.colorPixelFormat = .bgra8Unorm
-        mtkView.preferredFramesPerSecond = targetFPSLimit
-        mtkView.isPaused = false
-        mtkView.enableSetNeedsDisplay = false
-        mtkView.isUserInteractionEnabled = false
-        return mtkView
-    }
-    
-    func updateUIView(_ uiView: MTKView, context: Context) {
-        if uiView.preferredFramesPerSecond != targetFPSLimit {
-            uiView.preferredFramesPerSecond = targetFPSLimit
-        }
-    }
-    
-    class Coordinator: NSObject, MTKViewDelegate {
-        var parent: MetalViewportView
-        var commandQueue: MTLCommandQueue?
-        
-        init(_ parent: MetalViewportView) {
-            self.parent = parent
-            let device = MTLCreateSystemDefaultDevice()
-            let queue = device?.makeCommandQueue()
-            self.commandQueue = queue
-            super.init()
-            BramaCore.shared().attachMetalDevice(device, commandQueue: queue)
-        }
-        
-        func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
-            // Handle viewport resize (e.g. iPad orientation change)
-        }
-        
-        func draw(in view: MTKView) {
-            guard let drawable = view.currentDrawable,
-                  let renderPassDescriptor = view.currentRenderPassDescriptor,
-                  let commandQueue = commandQueue,
-                  let commandBuffer = commandQueue.makeCommandBuffer() else {
-                return
-            }
-            
-            // Invoke DXMT / Metal swapchain frame presentation hook in BramaCore (and libdxmt.dylib)
-            BramaCore.shared().presentDXMTFrame(
-                with: commandBuffer,
-                renderPassDescriptor: renderPassDescriptor
-            )
-            
-            guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor) else {
-                return
-            }
-            
-            renderEncoder.endEncoding()
-            commandBuffer.present(drawable)
-            commandBuffer.commit()
-        }
+
+    func updateUIView(_ uiView: BramaMetalSurfaceView, context: Context) {
+        BramaCore.shared().registerDisplay(uiView.metalLayer)
     }
 }

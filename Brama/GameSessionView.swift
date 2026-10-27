@@ -19,8 +19,13 @@ struct GameSessionView: View {
     @State private var isBootSequenceFinished: Bool = false
     @State private var showInGameMenu: Bool = false
     @State private var showBootConsole: Bool = true
+    @State private var showDiagnosticsCard: Bool = true
+    @State private var presentedFrameCount: UInt64 = 0
+    @State private var isWineProcessActive: Bool = false
     @State private var loadedPEInfo: BramaPEExecutableInfo? = nil
     @State private var runtimeStatus: BramaRuntimeModulesStatus? = nil
+
+    private let framePollTimer = Timer.publish(every: 0.3, on: .main, in: .common).autoconnect()
     
     var body: some View {
         ZStack {
@@ -28,13 +33,13 @@ struct GameSessionView: View {
             Color.black
                 .ignoresSafeArea()
             
-            // Native Metal GPU Viewport (Swapchain target for DXMT / MoltenVK)
+            // Native Metal GPU Viewport (Swapchain target for DXMT / Winios)
             MetalViewportView(targetFPSLimit: perfManager.targetFPSLimit)
                 .ignoresSafeArea()
-                .allowsHitTesting(false)
+                .allowsHitTesting(!showInGameMenu)
             
-            // Active PE32+ & UnityPlayer.dll Swapchain Framebuffer Inspector (when console is hidden or above)
-            if isBootSequenceFinished, let pe = loadedPEInfo, !showBootConsole {
+            // Active PE32+ & Wine ARM64EC Loading Card (auto-hides as soon as first DXMT/Winios frame is presented)
+            if isBootSequenceFinished, let pe = loadedPEInfo, !showBootConsole, showDiagnosticsCard, presentedFrameCount == 0 {
                 activeEngineFramebufferCard(pe: pe)
                     .transition(.opacity)
                     .zIndex(40)
@@ -54,8 +59,8 @@ struct GameSessionView: View {
                         inGameHUD
                         Spacer()
                     }
-                    .padding(.top, 14)
-                    .padding(.leading, 20)
+                    .padding(.top, controllerManager.showVirtualTouchControls ? 48 : 14)
+                    .padding(.leading, 24)
                     Spacer()
                 }
                 .allowsHitTesting(false)
@@ -125,6 +130,20 @@ struct GameSessionView: View {
         .preferredColorScheme(.dark)
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
+        .onReceive(framePollTimer) { _ in
+            let frames = BramaCore.shared().presentedFrameCount()
+            let wineActive = BramaCore.shared().isWineProcessRunning
+            isWineProcessActive = wineActive
+            if frames != presentedFrameCount {
+                presentedFrameCount = frames
+                if frames > 0 && (showBootConsole || showDiagnosticsCard) {
+                    withAnimation(.easeOut(duration: 0.3)) {
+                        showBootConsole = false
+                        showDiagnosticsCard = false
+                    }
+                }
+            }
+        }
         .onAppear {
             startBootSequence()
         }
@@ -418,19 +437,36 @@ struct GameSessionView: View {
                 }
                 Spacer()
                 
-                Button(action: {
-                    withAnimation { showBootConsole = true }
-                }) {
-                    HStack(spacing: 4) {
-                        Image(systemName: "terminal.fill")
-                        Text("Consola")
+                HStack(spacing: 8) {
+                    Button(action: {
+                        withAnimation { showBootConsole = true }
+                    }) {
+                        HStack(spacing: 4) {
+                            Image(systemName: "terminal.fill")
+                            Text("Consola")
+                        }
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(Color.white.opacity(0.12))
+                        .cornerRadius(8)
                     }
-                    .font(.system(size: 11, weight: .bold))
-                    .foregroundColor(.white)
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 6)
-                    .background(Color.white.opacity(0.12))
-                    .cornerRadius(8)
+
+                    Button(action: {
+                        withAnimation { showDiagnosticsCard = false }
+                    }) {
+                        HStack(spacing: 4) {
+                            Image(systemName: "eye.slash.fill")
+                            Text("Ocultar")
+                        }
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundColor(.cyan)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(Color.cyan.opacity(0.15))
+                        .cornerRadius(8)
+                    }
                 }
             }
             
@@ -451,10 +487,17 @@ struct GameSessionView: View {
                         .lineLimit(2)
                 }
                 
-                Text("Estado del Motor: El cargador PE32+ mapeó Hollow Knight.exe y UnityPlayer.dll (27.5 MB) e invocó UnityMain @ 0x7000527830. Para renderizar las escenas 3D/2D completas de UnityPlayer.dll se requiere el runtime completo de Wine64 + Mono (mono-2.0-bdwgc.dll) + compilador de shaders DXBC-a-Metal y JIT externo activo (StikDebug / SideStore).")
-                    .font(.system(size: 11))
-                    .foregroundColor(.white.opacity(0.85))
-                    .fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .progressViewStyle(CircularProgressViewStyle(tint: .cyan))
+                        .scaleEffect(0.75)
+                    Text(isWineProcessActive
+                         ? "Motor Wine 9.0 ARM64EC + FEX-Emu + DXMT Metal activo en segundo plano. Inicializando ventana DirectX 11 y compilando shaders... Esta tarjeta se ocultará automáticamente en cuanto el juego presente el primer frame."
+                         : "Cargando contenedor Wine 9.0 ARM64EC + FEX-Emu + DXMT Metal. Asegúrate de ejecutar la app con Xcode (Run) o StikDebug conectado para habilitar JIT.")
+                        .font(.system(size: 11))
+                        .foregroundColor(.white.opacity(0.9))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
         }
         .padding(18)

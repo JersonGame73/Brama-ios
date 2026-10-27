@@ -7,6 +7,8 @@
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#import <QuartzCore/CAMetalLayer.h>
+#import <CoreGraphics/CoreGraphics.h>
 
 NS_ASSUME_NONNULL_BEGIN
 
@@ -64,6 +66,46 @@ typedef void (^BramaLogCallback)(NSString *logMessage);
 /// Status of loaded dynamic translation libraries (.dylib)
 @property (nonatomic, strong, readonly) BramaRuntimeModulesStatus *runtimeStatus;
 
+/// Whether the native Madeira iOS runtime engine (libmadeira.dylib: Wine ARM64EC + FEX-Emu + DXMT + Winios) is loaded
+@property (nonatomic, assign, readonly) BOOL isMadeiraEngineLoaded;
+
+/// Whether the Wine guest process is currently running
+@property (nonatomic, assign, readonly) BOOL isWineProcessRunning;
+
+/// Canonical Wine prefix directory on iOS/iPadOS (<Documents>/wine)
+- (NSString *)canonicalWinePrefixPath;
+
+/// Total DXMT Metal + Winios GDI frames presented by the active Windows game
+- (uint64_t)presentedFrameCount;
+
+/// Registers the persistent CAMetalLayer used by DXMT / D3D11 / D3D12 swapchains
+- (void)registerDisplayMetalLayer:(CAMetalLayer *)metalLayer;
+
+/// Updates the window compositor frame and desktop rect for Winios / DXMT presentation
+- (void)updateViewportFrame:(CGRect)windowFrame desktopRect:(CGRect)desktopRect;
+
+/// Returns the active Windows guest desktop resolution (e.g. 1280x720)
+- (CGSize)guestScreenSize;
+
+/// Forwards touch events (mapped to guest desktop pixel coordinates) to Winios mouse driver
+- (void)postTouchDownAtX:(int)x y:(int)y;
+- (void)postTouchMoveAtX:(int)x y:(int)y;
+- (void)postTouchUpAtX:(int)x y:(int)y;
+
+/// Forwards Win32 virtual key code events (e.g. VK_RETURN=0x0D, VK_SPACE=0x20, VK_ESCAPE=0x1B)
+- (void)postKeyVirtualCode:(int)vk isDown:(BOOL)down;
+
+/// Updates XInput gamepad state in Winios for player slot (0..3)
+- (void)updateGamepadStateAtIndex:(int)index
+                          buttons:(uint16_t)buttons
+                      leftTrigger:(uint8_t)leftTrigger
+                     rightTrigger:(uint8_t)rightTrigger
+                            leftX:(int16_t)leftX
+                            leftY:(int16_t)leftY
+                           rightX:(int16_t)rightX
+                           rightY:(int16_t)rightY
+                        connected:(BOOL)connected;
+
 /// Tests whether the iOS/iPadOS kernel permits JIT execution (MAP_JIT RWX memory page allocation)
 - (BOOL)isJITAvailable;
 
@@ -72,11 +114,11 @@ typedef void (^BramaLogCallback)(NSString *logMessage);
 
 /// Attaches the Apple Silicon Metal GPU device and command queue for DXMT / D3D11-to-Metal presentation
 - (void)attachMetalDevice:(nullable id<MTLDevice>)device
-             commandQueue:(nullable id<MTLCommandQueue>)commandQueue;
+              commandQueue:(nullable id<MTLCommandQueue>)commandQueue;
 
 /// Invokes the DXMT / Metal swapchain presentation hook for the active frame
 - (void)presentDXMTFrameWithCommandBuffer:(nullable id<MTLCommandBuffer>)commandBuffer
-                     renderPassDescriptor:(nullable MTLRenderPassDescriptor *)renderPassDescriptor;
+                      renderPassDescriptor:(nullable MTLRenderPassDescriptor *)renderPassDescriptor;
 
 /// Prepares the sandboxed Windows filesystem hierarchy (drive_c, windows, system32, runtime dylibs)
 - (BOOL)prepareWinePrefixAtPath:(NSString *)prefixPath error:(NSError **)error;
@@ -93,7 +135,7 @@ typedef void (^BramaLogCallback)(NSString *logMessage);
 - (BramaRuntimeModulesStatus *)initializeEmulationSubsystemsWithPrefix:(NSString *)prefixPath
                                                            logCallback:(nullable BramaLogCallback)callback;
 
-/// Launches a Windows binary executable using the PE Loader, JIT/Interpreter CPU bridge, and DXMT Metal layer
+/// Launches a Windows binary executable using the Madeira Wine64 ARM64EC + FEX-Emu + DXMT Metal engine
 - (BOOL)launchExecutableAtPath:(NSString *)executablePath
                     prefixPath:(NSString *)prefixPath
                      arguments:(NSString *)arguments

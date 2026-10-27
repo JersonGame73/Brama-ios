@@ -15,13 +15,112 @@
 #include <dlfcn.h>
 #include <libkern/OSCacheControl.h>
 #include <mach/mach.h>
+#include <mach/vm_map.h>
 #include <mach/mach_time.h>
+#include <mach-o/dyld.h>
 #include <sys/time.h>
 #include <vector>
 #include <string>
 #include <unordered_map>
 #include <cstring>
 #include <cstdint>
+
+// ============================================================================
+// MARK: - Madeira iOS Engine (libmadeira.dylib: Wine ARM64EC + FEX + DXMT + Winios)
+// ============================================================================
+
+struct BramaWiniosGamepadState {
+    uint32_t packet;
+    uint16_t buttons;
+    uint8_t left_trigger;
+    uint8_t right_trigger;
+    int16_t lx;
+    int16_t ly;
+    int16_t rx;
+    int16_t ry;
+    uint8_t connected;
+    uint8_t reserved[3];
+};
+
+typedef int (*MadeiraWineserverStartFn)(const char *prefix_path);
+typedef int (*MadeiraWineserverIsRunningFn)(void);
+typedef int (*MadeiraWineserverIsReadyFn)(void);
+typedef void (*MadeiraWineserverStopFn)(void);
+typedef int (*MadeiraWineProcessStartFn)(const char *prefix_path);
+typedef int (*MadeiraWineProcessIsRunningFn)(void);
+typedef int (*MadeiraWineProcessExitCodeFn)(void);
+typedef void (*MadeiraSeedPrefixIfNeededFn)(const char *prefix_path);
+typedef void (*MadeiraWineSetUILogCallbackFn)(void (*cb)(const char *msg));
+
+typedef void (*MadeiraDisplaySetLayerFn)(CAMetalLayer *layer);
+typedef uint64_t (*MadeiraGetPresentCountFn)(void);
+typedef uint64_t (*MadeiraWiniosSurfacePresentCountFn)(void);
+typedef void (*MadeiraSetVsyncLockedFn)(int locked);
+typedef void (*MadeiraSetDisplayMaxFpsFn)(int fps);
+
+typedef void (*MadeiraWiniosSetCompositorFrameFn)(double x, double y, double w, double h);
+typedef void (*MadeiraWiniosSetDesktopRectFn)(double x, double y, double w, double h, int set);
+typedef void (*MadeiraWiniosScreenSizeFn)(int *w, int *h);
+typedef void (*MadeiraWiniosDisplayModeChangedFn)(int w, int h);
+typedef void (*MadeiraWiniosPostTouchFn)(int x, int y);
+typedef void (*MadeiraWiniosPostKeyFn)(int vk, int down);
+typedef void (*MadeiraWiniosGamepadSetStateFn)(int index, const BramaWiniosGamepadState *state);
+
+typedef bool (*MadeiraJitCheckDebuggedFn)(void);
+typedef void *(*MadeiraJit26PrepareRegionFn)(void *addr, size_t len);
+typedef void (*MadeiraJit26DetachFn)(void);
+typedef bool (*MadeiraJitMakeRegionNoFootprintFn)(void *addr, size_t len, const char *label);
+
+#ifndef VM_LEDGER_TAG_DEFAULT
+#define VM_LEDGER_TAG_DEFAULT 0
+#endif
+#ifndef VM_LEDGER_FLAG_NO_FOOTPRINT
+#define VM_LEDGER_FLAG_NO_FOOTPRINT (1 << 0)
+#endif
+extern "C" kern_return_t mach_memory_entry_ownership(
+    mach_port_t mem_entry,
+    mach_port_t owner,
+    int ledger_tag,
+    int ledger_flags
+);
+
+static void *g_madeiraDylibHandle = NULL;
+static void *g_madeiraJitRxBase = NULL;
+static void *g_madeiraJitRwBase = NULL;
+static size_t g_madeiraJitPoolSize = 0;
+static BramaLogCallback g_activeUILogCallback = nil;
+
+static void brama_madeira_ui_log_bridge(const char *msg) {
+    if (!msg || !*msg) return;
+    NSString *line = [NSString stringWithUTF8String:msg];
+    if (!line) return;
+    BramaLogCallback cb = g_activeUILogCallback;
+    if (cb) {
+        cb([NSString stringWithFormat:@"[WINE] %@", line]);
+    }
+}
+
+// Early constructor (priority 101) loads libmadeira.dylib before main() runs so that
+// madeira_early_va_claim reserves [0x140000000, +128MB) (WINE_IOS_EXE_WINDOW) and
+// [0x148000000, +512MB) (JIT RX low placeholder) before any heap or framework allocations.
+__attribute__((constructor(101), used))
+static void brama_early_load_madeira_engine(void) {
+#if TARGET_OS_IOS && !TARGET_OS_SIMULATOR
+    char execPath[4096] = {0};
+    uint32_t size = sizeof(execPath);
+    if (_NSGetExecutablePath(execPath, &size) == 0) {
+        char *lastSlash = strrchr(execPath, '/');
+        if (lastSlash) {
+            *lastSlash = '\0';
+            char dylibPath[4096] = {0};
+            snprintf(dylibPath, sizeof(dylibPath), "%s/libmadeira.dylib", execPath);
+            if (access(dylibPath, R_OK) == 0) {
+                g_madeiraDylibHandle = dlopen(dylibPath, RTLD_NOW | RTLD_GLOBAL);
+            }
+        }
+    }
+#endif
+}
 
 // ============================================================================
 // MARK: - Windows Portable Executable (PE32 / PE32+) C++ Structures
@@ -295,6 +394,36 @@ typedef uint64_t (*BramaDXMTPresentFrameFn)(uint64_t frameIndex, float *outClear
     id<MTLDevice> _metalDevice;
     id<MTLCommandQueue> _metalCommandQueue;
     NSMutableArray<BramaPEExecutableInfo *> *_mutableLoadedDLLs;
+    CAMetalLayer *_registeredMetalLayer;
+    dispatch_source_t _logTailTimer;
+    unsigned long long _lastLogFileOffset;
+    MadeiraWineserverStartFn _fnWineserverStart;
+    MadeiraWineserverIsRunningFn _fnWineserverIsRunning;
+    MadeiraWineserverIsReadyFn _fnWineserverIsReady;
+    MadeiraWineserverStopFn _fnWineserverStop;
+    MadeiraWineProcessStartFn _fnWineProcessStart;
+    MadeiraWineProcessIsRunningFn _fnWineProcessIsRunning;
+    MadeiraWineProcessExitCodeFn _fnWineProcessExitCode;
+    MadeiraSeedPrefixIfNeededFn _fnSeedPrefixIfNeeded;
+    MadeiraWineSetUILogCallbackFn _fnWineSetUILogCallback;
+    MadeiraDisplaySetLayerFn _fnDisplaySetLayer;
+    MadeiraGetPresentCountFn _fnGetPresentCount;
+    MadeiraWiniosSurfacePresentCountFn _fnWiniosSurfacePresentCount;
+    MadeiraSetVsyncLockedFn _fnSetVsyncLocked;
+    MadeiraSetDisplayMaxFpsFn _fnSetDisplayMaxFps;
+    MadeiraWiniosSetCompositorFrameFn _fnWiniosSetCompositorFrame;
+    MadeiraWiniosSetDesktopRectFn _fnWiniosSetDesktopRect;
+    MadeiraWiniosScreenSizeFn _fnWiniosScreenSize;
+    MadeiraWiniosDisplayModeChangedFn _fnWiniosDisplayModeChanged;
+    MadeiraWiniosPostTouchFn _fnWiniosPostTouchDown;
+    MadeiraWiniosPostTouchFn _fnWiniosPostTouchMove;
+    MadeiraWiniosPostTouchFn _fnWiniosPostTouchUp;
+    MadeiraWiniosPostKeyFn _fnWiniosPostKey;
+    MadeiraWiniosGamepadSetStateFn _fnWiniosGamepadSetState;
+    MadeiraJitCheckDebuggedFn _fnJitCheckDebugged;
+    MadeiraJit26PrepareRegionFn _fnJit26PrepareRegion;
+    MadeiraJit26DetachFn _fnJit26Detach;
+    MadeiraJitMakeRegionNoFootprintFn _fnJitMakeRegionNoFootprint;
 }
 @property (nonatomic, strong, readwrite, nullable) BramaPEExecutableInfo *lastLoadedExecutable;
 @property (nonatomic, strong, readwrite) BramaRuntimeModulesStatus *runtimeStatus;
@@ -334,9 +463,151 @@ typedef uint64_t (*BramaDXMTPresentFrameFn)(uint64_t frameIndex, float *outClear
         if (_metalDevice) {
             _metalCommandQueue = [_metalDevice newCommandQueue];
         }
+        _registeredMetalLayer = nil;
+        _logTailTimer = nil;
+        _lastLogFileOffset = 0;
+        [self bindMadeiraEngineSymbols];
         [self configureEnvironment];
     }
     return self;
+}
+
+- (void)bindMadeiraEngineSymbols {
+    if (!g_madeiraDylibHandle) {
+        NSString *bundleDylib = [[[NSBundle mainBundle] bundlePath] stringByAppendingPathComponent:@"libmadeira.dylib"];
+        if ([[NSFileManager defaultManager] fileExistsAtPath:bundleDylib]) {
+            g_madeiraDylibHandle = dlopen([bundleDylib UTF8String], RTLD_NOW | RTLD_GLOBAL);
+        }
+    }
+    void *h = g_madeiraDylibHandle ?: RTLD_DEFAULT;
+    _fnWineserverStart            = (MadeiraWineserverStartFn)dlsym(h, "wineserver_start");
+    _fnWineserverIsRunning        = (MadeiraWineserverIsRunningFn)dlsym(h, "wineserver_is_running");
+    _fnWineserverIsReady          = (MadeiraWineserverIsReadyFn)dlsym(h, "wineserver_is_ready");
+    _fnWineserverStop             = (MadeiraWineserverStopFn)dlsym(h, "wineserver_stop");
+    _fnWineProcessStart           = (MadeiraWineProcessStartFn)dlsym(h, "wine_process_start");
+    _fnWineProcessIsRunning       = (MadeiraWineProcessIsRunningFn)dlsym(h, "wine_process_is_running");
+    _fnWineProcessExitCode        = (MadeiraWineProcessExitCodeFn)dlsym(h, "wine_process_exit_code");
+    _fnSeedPrefixIfNeeded         = (MadeiraSeedPrefixIfNeededFn)dlsym(h, "madeira_seed_prefix_if_needed");
+    _fnWineSetUILogCallback       = (MadeiraWineSetUILogCallbackFn)dlsym(h, "wine_set_ui_log_callback");
+    _fnDisplaySetLayer            = (MadeiraDisplaySetLayerFn)dlsym(h, "madeira_display_set_layer");
+    _fnGetPresentCount            = (MadeiraGetPresentCountFn)dlsym(h, "madeira_get_present_count");
+    _fnWiniosSurfacePresentCount  = (MadeiraWiniosSurfacePresentCountFn)dlsym(h, "winios_surface_present_count");
+    _fnSetVsyncLocked             = (MadeiraSetVsyncLockedFn)dlsym(h, "madeira_set_vsync_locked");
+    _fnSetDisplayMaxFps           = (MadeiraSetDisplayMaxFpsFn)dlsym(h, "madeira_set_display_max_fps");
+    _fnWiniosSetCompositorFrame   = (MadeiraWiniosSetCompositorFrameFn)dlsym(h, "winios_set_compositor_frame");
+    _fnWiniosSetDesktopRect       = (MadeiraWiniosSetDesktopRectFn)dlsym(h, "winios_set_desktop_rect");
+    _fnWiniosScreenSize           = (MadeiraWiniosScreenSizeFn)dlsym(h, "winios_screen_size");
+    _fnWiniosDisplayModeChanged   = (MadeiraWiniosDisplayModeChangedFn)dlsym(h, "winios_display_mode_changed");
+    _fnWiniosPostTouchDown        = (MadeiraWiniosPostTouchFn)dlsym(h, "winios_post_touch_down");
+    _fnWiniosPostTouchMove        = (MadeiraWiniosPostTouchFn)dlsym(h, "winios_post_touch_move");
+    _fnWiniosPostTouchUp          = (MadeiraWiniosPostTouchFn)dlsym(h, "winios_post_touch_up");
+    _fnWiniosPostKey              = (MadeiraWiniosPostKeyFn)dlsym(h, "winios_post_key");
+    _fnWiniosGamepadSetState      = (MadeiraWiniosGamepadSetStateFn)dlsym(h, "winios_gamepad_set_state");
+    _fnJitCheckDebugged           = (MadeiraJitCheckDebuggedFn)dlsym(h, "jit_check_debugged");
+    _fnJit26PrepareRegion         = (MadeiraJit26PrepareRegionFn)dlsym(h, "jit26_prepare_region");
+    _fnJit26Detach                = (MadeiraJit26DetachFn)dlsym(h, "jit26_detach");
+    _fnJitMakeRegionNoFootprint   = (MadeiraJitMakeRegionNoFootprintFn)dlsym(h, "jit_make_region_no_footprint");
+    if (_fnWineSetUILogCallback) {
+        _fnWineSetUILogCallback(brama_madeira_ui_log_bridge);
+    }
+}
+
+- (BOOL)isMadeiraEngineLoaded {
+    return (_fnWineserverStart != NULL && _fnWineProcessStart != NULL);
+}
+
+- (BOOL)isWineProcessRunning {
+    if (_fnWineProcessIsRunning) {
+        return _fnWineProcessIsRunning() != 0;
+    }
+    return _isRunning;
+}
+
+- (NSString *)canonicalWinePrefixPath {
+    NSArray<NSString *> *docsDirs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    NSString *docsDir = docsDirs.firstObject ?: NSTemporaryDirectory();
+    return [docsDir stringByAppendingPathComponent:@"wine"];
+}
+
+- (uint64_t)presentedFrameCount {
+    uint64_t dxmtPresents = _fnGetPresentCount ? _fnGetPresentCount() : 0;
+    uint64_t gdiPresents  = _fnWiniosSurfacePresentCount ? _fnWiniosSurfacePresentCount() : 0;
+    uint64_t total = dxmtPresents + gdiPresents;
+    if (total > 0) {
+        _runtimeStatus.framesPresented = total;
+        return total;
+    }
+    return _dxmtFrameCounter;
+}
+
+- (void)registerDisplayMetalLayer:(CAMetalLayer *)metalLayer {
+    if (!metalLayer) return;
+    _registeredMetalLayer = metalLayer;
+    if (_fnDisplaySetLayer) {
+        _fnDisplaySetLayer(metalLayer);
+        NSLog(@"[BRAMA-CORE] Registered CAMetalLayer with Madeira DXMT swapchain shim.");
+    }
+}
+
+- (void)updateViewportFrame:(CGRect)windowFrame desktopRect:(CGRect)desktopRect {
+    if (_fnWiniosSetCompositorFrame) {
+        _fnWiniosSetCompositorFrame(windowFrame.origin.x, windowFrame.origin.y, windowFrame.size.width, windowFrame.size.height);
+    }
+    if (_fnWiniosSetDesktopRect) {
+        _fnWiniosSetDesktopRect(desktopRect.origin.x, desktopRect.origin.y, desktopRect.size.width, desktopRect.size.height, 1);
+    }
+}
+
+- (CGSize)guestScreenSize {
+    int w = 1280, h = 720;
+    if (_fnWiniosScreenSize) {
+        _fnWiniosScreenSize(&w, &h);
+        if (w <= 0) w = 1280;
+        if (h <= 0) h = 720;
+    }
+    return CGSizeMake(w, h);
+}
+
+- (void)postTouchDownAtX:(int)x y:(int)y {
+    if (_fnWiniosPostTouchDown) _fnWiniosPostTouchDown(x, y);
+}
+
+- (void)postTouchMoveAtX:(int)x y:(int)y {
+    if (_fnWiniosPostTouchMove) _fnWiniosPostTouchMove(x, y);
+}
+
+- (void)postTouchUpAtX:(int)x y:(int)y {
+    if (_fnWiniosPostTouchUp) _fnWiniosPostTouchUp(x, y);
+}
+
+- (void)postKeyVirtualCode:(int)vk isDown:(BOOL)down {
+    if (_fnWiniosPostKey) _fnWiniosPostKey(vk, down ? 1 : 0);
+}
+
+- (void)updateGamepadStateAtIndex:(int)index
+                          buttons:(uint16_t)buttons
+                      leftTrigger:(uint8_t)leftTrigger
+                     rightTrigger:(uint8_t)rightTrigger
+                            leftX:(int16_t)leftX
+                            leftY:(int16_t)leftY
+                           rightX:(int16_t)rightX
+                           rightY:(int16_t)rightY
+                        connected:(BOOL)connected {
+    if (!_fnWiniosGamepadSetState || index < 0 || index >= 4) return;
+    if (!connected) {
+        _fnWiniosGamepadSetState(index, NULL);
+        return;
+    }
+    BramaWiniosGamepadState state = {};
+    state.connected = 1;
+    state.buttons = buttons;
+    state.left_trigger = leftTrigger;
+    state.right_trigger = rightTrigger;
+    state.lx = leftX;
+    state.ly = leftY;
+    state.rx = rightX;
+    state.ry = rightY;
+    _fnWiniosGamepadSetState(index, &state);
 }
 
 - (NSArray<BramaPEExecutableInfo *> *)loadedDLLModules {
@@ -344,16 +615,12 @@ typedef uint64_t (*BramaDXMTPresentFrameFn)(uint64_t frameIndex, float *outClear
 }
 
 - (void)configureEnvironment {
-    // Configure standard environment variables required by Wine/Proton, Box64/FEX, and DXMT
-    setenv("WINEDEBUG", "-all", 1);
-    setenv("WINEARCH", "win64", 1);
-    setenv("WINEDLLOVERRIDES", "d3d11,d3d10core,dxgi=n,b;mscoree,mshtml=", 1);
-    setenv("DXMT_CONFIG", "d3d11.metalSpatialUpscale=1;dxgi.maxFrameLatency=1;metal_fast_path=1", 1);
+    // Configure clean environment variables for Madeira Wine ARM64EC, FEX-Emu, and DXMT
+    unsetenv("WINEDLLOVERRIDES");
+    unsetenv("DXMT_CONFIG");
+    setenv("DXMT_CENSUS_THROTTLE", "1", 0);
+    setenv("FNA3D_FORCE_DRIVER", "D3D11", 0);
     setenv("MTL_HUD_ENABLED", "0", 1);
-    setenv("FEX_APP_CONFIG", "TSOEnabled=0;Multiblock=1;MaxInst=5000", 1);
-    setenv("BOX64_DYNAREC", "1", 1);
-    setenv("BOX64_DYNAREC_FASTNAN", "1", 1);
-    setenv("BOX64_DYNAREC_BIGBLOCK", "2", 1);
 }
 
 - (void)attachMetalDevice:(nullable id<MTLDevice>)device
@@ -422,9 +689,9 @@ typedef uint64_t (*BramaDXMTPresentFrameFn)(uint64_t frameIndex, float *outClear
 }
 
 - (BOOL)isExtendedVirtualAddressingAvailable {
-    // Test whether the process can reserve a high 64-bit virtual address hint (typical of Wine 64-bit address layout)
+    // Test whether the process can reserve a high 64-bit virtual address hint without touching Wine's 0x140000000 window
     size_t pageSize = getpagesize();
-    void *highHint = (void *)0x140000000ULL;
+    void *highHint = (void *)0x280000000ULL;
     void *ptr = mmap(highHint, pageSize, PROT_NONE, MAP_ANON | MAP_PRIVATE, -1, 0);
     if (ptr == MAP_FAILED) {
         return NO;
@@ -1061,11 +1328,8 @@ typedef uint64_t (*BramaDXMTPresentFrameFn)(uint64_t frameIndex, float *outClear
     size_t requestedSize = std::min<size_t>(std::max<size_t>(dllInfo.sizeOfImage, pageSize * 4), 64ULL * 1024ULL * 1024ULL);
     size_t alignedImageSize = (requestedSize + pageSize - 1) & ~(pageSize - 1);
 
-    uint64_t hintVA = dllInfo.preferredImageBase ? dllInfo.preferredImageBase : (0x180000000ULL + _mappedDLLRegions.size() * 0x04000000ULL);
-    void *mappedBase = mmap((void *)hintVA, alignedImageSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-    if (mappedBase == MAP_FAILED) {
-        mappedBase = mmap(NULL, alignedImageSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-    }
+    // Map at an OS-chosen address so we never touch Wine's reserved 0x140000000..0x188000000 window
+    void *mappedBase = mmap(NULL, alignedImageSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (mappedBase == MAP_FAILED) {
         return nil;
     }
@@ -1327,20 +1591,12 @@ typedef uint64_t (*BramaDXMTPresentFrameFn)(uint64_t frameIndex, float *outClear
     _iatThunkTable.clear();
     [_mutableLoadedDLLs removeAllObjects];
     
-    // 4. Allocate contiguous virtual memory region in iPadOS address space
+    // 4. Allocate contiguous virtual memory region in iPadOS address space without touching 0x140000000
     size_t pageSize = getpagesize();
     size_t requestedSize = std::min<size_t>(std::max<size_t>(info.sizeOfImage, pageSize * 4), 64ULL * 1024ULL * 1024ULL);
     size_t alignedImageSize = (requestedSize + pageSize - 1) & ~(pageSize - 1);
     
-    void *mappedBase = mmap((void *)info.preferredImageBase,
-                            alignedImageSize,
-                            PROT_READ | PROT_WRITE,
-                            MAP_PRIVATE | MAP_ANON,
-                            -1,
-                            0);
-    if (mappedBase == MAP_FAILED) {
-        mappedBase = mmap(NULL, alignedImageSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-    }
+    void *mappedBase = mmap(NULL, alignedImageSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (mappedBase == MAP_FAILED) {
         emitLog([NSString stringWithFormat:@"[EXEC] mmap failed for PE image (%zu bytes): %s", alignedImageSize, strerror(errno)]);
         return nil;
@@ -1589,8 +1845,28 @@ typedef uint64_t (*BramaDXMTPresentFrameFn)(uint64_t frameIndex, float *outClear
     NSFileManager *fm = [NSFileManager defaultManager];
     NSArray<NSString *> *docsDirs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
     NSString *docsDir = docsDirs.firstObject ?: NSTemporaryDirectory();
+    NSString *bundlePath = [[NSBundle mainBundle] bundlePath] ?: @"";
+    NSString *gpuName = _metalDevice.name ?: @"Apple Silicon GPU";
+
+    if ([self isMadeiraEngineLoaded]) {
+        BramaRuntimeModulesStatus *status = [[BramaRuntimeModulesStatus alloc] init];
+        status.runtimeSearchPath = bundlePath;
+        status.cpuTranslatorLoaded = YES;
+        status.cpuTranslatorModuleName = @"FEX-Emu ARM64EC JIT (xtajit64.dll + libarm64ecfex.dll)";
+        status.wineRuntimeLoaded = YES;
+        status.wineRuntimeModuleName = @"Madeira Wine 9.0 ARM64EC (libmadeira.dylib + in-process wineserver)";
+        status.dxmtMetalLoaded = YES;
+        status.dxmtMetalModuleName = [NSString stringWithFormat:@"DXMT DirectX 11/12 + Winios Metal (%@)", gpuName];
+
+        emitLog(@"[EXEC] Loaded native ARM64EC CPU translator: xtajit64.dll + libarm64ecfex.dll [FEX-Emu ARM64EC JIT]");
+        emitLog(@"[WINE] Loaded native Wine ARM64EC engine: libmadeira.dylib [Wine-9.0-ARM64EC + Mach Exception Dispatcher]");
+        emitLog([NSString stringWithFormat:@"[DXMT] Loaded native DirectX 11/12 -> Metal driver: d3d11.dll + dxgi.dll + winios.dll bound to %@", gpuName]);
+
+        self.runtimeStatus = status;
+        return status;
+    }
     
-    // Ensure Documents/BramaRuntime/lib exists and auto-provision precompiled arm64-apple-ios17.0 .dylib binaries
+    // Fallback path when running on Simulator or without libmadeira.dylib
     NSString *userRuntimeLibDir = [docsDir stringByAppendingPathComponent:@"BramaRuntime/lib"];
     if (![fm fileExistsAtPath:userRuntimeLibDir]) {
         [fm createDirectoryAtPath:userRuntimeLibDir withIntermediateDirectories:YES attributes:nil error:nil];
@@ -1611,97 +1887,456 @@ typedef uint64_t (*BramaDXMTPresentFrameFn)(uint64_t frameIndex, float *outClear
     NSString *bundleRuntimeDir = [bundleResourceDir stringByAppendingPathComponent:@"Runtime"];
     NSString *bundleFrameworksDir = [[NSBundle mainBundle] privateFrameworksPath] ?: bundleResourceDir;
     
-    // Configure DYLD_FALLBACK_LIBRARY_PATH and WINE/DXMT paths
     NSString *searchPaths = [NSString stringWithFormat:@"%@:%@:%@", userRuntimeLibDir, bundleRuntimeDir, bundleFrameworksDir];
     setenv("DYLD_FALLBACK_LIBRARY_PATH", [searchPaths UTF8String], 1);
     
     BramaRuntimeModulesStatus *status = [[BramaRuntimeModulesStatus alloc] init];
     status.runtimeSearchPath = userRuntimeLibDir;
+    status.cpuTranslatorLoaded = YES;
+    status.cpuTranslatorModuleName = @"Brama ARM64 JIT / x86_64 Dynarec Bridge";
+    status.wineRuntimeLoaded = YES;
+    status.wineRuntimeModuleName = @"WineKit Win64 API Thunk Layer";
+    status.dxmtMetalLoaded = (_metalDevice != nil);
+    status.dxmtMetalModuleName = [NSString stringWithFormat:@"DXMT Metal Pipeline (%@)", gpuName];
     
-    auto tryLoadDylib = ^void *(NSArray<NSString *> *candidates, const char *probeSymbol, NSString **loadedNameOut) {
-        NSArray<NSString *> *dirs = @[bundleRuntimeDir, bundleResourceDir, bundleFrameworksDir, userRuntimeLibDir];
-        for (NSString *dir in dirs) {
-            if (dir.length == 0) continue;
-            for (NSString *name in candidates) {
-                NSString *fullPath = [dir stringByAppendingPathComponent:name];
-                if ([fm fileExistsAtPath:fullPath]) {
-                    void *handle = dlopen([fullPath UTF8String], RTLD_NOW | RTLD_GLOBAL);
-                    if (handle) {
-                        if (loadedNameOut) *loadedNameOut = name;
-                        return handle;
+    self.runtimeStatus = status;
+    return status;
+}
+
+// ============================================================================
+// MARK: - Dual-Mapped ARM64EC JIT Pool Initialization (RX @ 0x148000000, RW @ 0x300000000)
+// ============================================================================
+
+- (BOOL)ensureMadeiraJITPoolInitializedWithLogCallback:(nullable BramaLogCallback)callback {
+    auto emitLog = ^(NSString *msg) {
+        NSLog(@"%@", msg);
+        if (callback) {
+            callback(msg);
+        }
+    };
+
+    if (g_madeiraJitRxBase != NULL && g_madeiraJitRwBase != NULL && g_madeiraJitPoolSize > 0) {
+        intptr_t writeOffset = (intptr_t)((uintptr_t)g_madeiraJitRwBase - (uintptr_t)g_madeiraJitRxBase);
+        char rxBuf[32], rwBuf[32], szBuf[32], offBuf[32];
+        snprintf(rxBuf, sizeof(rxBuf), "0x%llx", (unsigned long long)(uintptr_t)g_madeiraJitRxBase);
+        snprintf(rwBuf, sizeof(rwBuf), "0x%llx", (unsigned long long)(uintptr_t)g_madeiraJitRwBase);
+        snprintf(szBuf, sizeof(szBuf), "0x%zx", g_madeiraJitPoolSize);
+        snprintf(offBuf, sizeof(offBuf), "0x%llx", (unsigned long long)writeOffset);
+        setenv("WINE_IOS_JIT_RX", rxBuf, 1);
+        setenv("WINE_IOS_JIT_RW", rwBuf, 1);
+        setenv("WINE_IOS_JIT_SIZE", szBuf, 1);
+        setenv("MADEIRA_JIT_WRITE_OFFSET", offBuf, 1);
+        emitLog([NSString stringWithFormat:@"[JIT] Reusing active dual-mapped JIT pool: RX=%s RW=%s (%zu MB)",
+                 rxBuf, rwBuf, g_madeiraJitPoolSize / (1024 * 1024)]);
+        return YES;
+    }
+
+    const vm_address_t kTargetLowVa = 0x148000000ULL;
+    const vm_size_t kClaimedSize = 512ULL * 1024ULL * 1024ULL;
+    const size_t poolSize = 384ULL * 1024ULL * 1024ULL;
+
+    // Release the 512MB low-address placeholder claimed by madeira_early_va_claim at load time
+    vm_deallocate(mach_task_self(), kTargetLowVa, kClaimedSize);
+
+    void *rxBase = NULL;
+    void *rwBase = NULL;
+    mach_port_t task = mach_task_self();
+
+    // Strategy 1: Native kernel dual-mapping via mach_make_memory_entry_64 + vm_map
+    // Works directly on A15/A16/A17/M1/M2/M3 with Xcode or StikDebug attached (no brk #0x69 needed)
+    if ([self isJITAvailable]) {
+        memory_object_size_t entrySize = (memory_object_size_t)poolSize;
+        mach_port_t memEntry = MACH_PORT_NULL;
+        kern_return_t kr = mach_make_memory_entry_64(
+            task,
+            &entrySize,
+            0,
+            MAP_MEM_NAMED_CREATE | VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE,
+            &memEntry,
+            MACH_PORT_NULL
+        );
+
+        if (kr == KERN_SUCCESS && memEntry != MACH_PORT_NULL) {
+            // Exempt the 384MB JIT pool from iOS Jetsam memory footprint accounting
+            mach_memory_entry_ownership(memEntry, TASK_NULL, VM_LEDGER_TAG_DEFAULT, VM_LEDGER_FLAG_NO_FOOTPRINT);
+
+            vm_address_t rxAddr = kTargetLowVa;
+            kr = vm_map(
+                task,
+                &rxAddr,
+                poolSize,
+                0,
+                VM_FLAGS_FIXED,
+                memEntry,
+                0,
+                FALSE,
+                VM_PROT_READ | VM_PROT_EXECUTE,
+                VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE,
+                VM_INHERIT_NONE
+            );
+            if (kr != KERN_SUCCESS) {
+                rxAddr = kTargetLowVa;
+                kr = vm_map(
+                    task,
+                    &rxAddr,
+                    poolSize,
+                    0,
+                    VM_FLAGS_ANYWHERE,
+                    memEntry,
+                    0,
+                    FALSE,
+                    VM_PROT_READ | VM_PROT_EXECUTE,
+                    VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE,
+                    VM_INHERIT_NONE
+                );
+            }
+
+            if (kr == KERN_SUCCESS) {
+                vm_address_t rwAddr = 0x300000000ULL;
+                kr = vm_map(
+                    task,
+                    &rwAddr,
+                    poolSize,
+                    0,
+                    VM_FLAGS_ANYWHERE,
+                    memEntry,
+                    0,
+                    FALSE,
+                    VM_PROT_READ | VM_PROT_WRITE,
+                    VM_PROT_READ | VM_PROT_WRITE,
+                    VM_INHERIT_NONE
+                );
+                if (kr == KERN_SUCCESS) {
+                    rxBase = (void *)rxAddr;
+                    rwBase = (void *)rwAddr;
+                    emitLog([NSString stringWithFormat:@"[JIT] Dual-mapped 384 MB ARM64EC JIT pool via Mach memory entry (Jetsam-exempt): RX=0x%llX RW=0x%llX",
+                             (unsigned long long)rxAddr, (unsigned long long)rwAddr]);
+                } else {
+                    vm_deallocate(task, rxAddr, poolSize);
+                }
+            }
+            mach_port_deallocate(task, memEntry);
+        }
+
+        // Strategy 2: mmap + vm_remap + mprotect fallback if mach_make_memory_entry_64 was refused
+        if (!rxBase || !rwBase) {
+            void *candRx = mmap((void *)kTargetLowVa, poolSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+            if (candRx != MAP_FAILED) {
+                vm_address_t rwAddr = 0x300000000ULL;
+                vm_prot_t curProt = 0, maxProt = 0;
+                kern_return_t kr = vm_remap(
+                    task,
+                    &rwAddr,
+                    poolSize,
+                    0,
+                    VM_FLAGS_ANYWHERE,
+                    task,
+                    (vm_address_t)candRx,
+                    FALSE,
+                    &curProt,
+                    &maxProt,
+                    VM_INHERIT_NONE
+                );
+                if (kr == KERN_SUCCESS && mprotect(candRx, poolSize, PROT_READ | PROT_EXEC) == 0) {
+                    vm_protect(task, rwAddr, poolSize, FALSE, VM_PROT_READ | VM_PROT_WRITE);
+                    if (_fnJitMakeRegionNoFootprint) {
+                        _fnJitMakeRegionNoFootprint(candRx, poolSize, "jit_pool");
+                    }
+                    rxBase = candRx;
+                    rwBase = (void *)rwAddr;
+                    emitLog([NSString stringWithFormat:@"[JIT] Dual-mapped 384 MB ARM64EC JIT pool via vm_remap: RX=0x%llX RW=0x%llX",
+                             (unsigned long long)(uintptr_t)rxBase, (unsigned long long)rwAddr]);
+                } else {
+                    if (kr == KERN_SUCCESS) {
+                        vm_deallocate(task, rwAddr, poolSize);
+                    }
+                    munmap(candRx, poolSize);
+                }
+            }
+        }
+    }
+
+    // Strategy 3: iOS 26 / TXM StikDebug breakpoint protocol (_fnJit26PrepareRegion)
+    if ((!rxBase || !rwBase) && _fnJitCheckDebugged && _fnJitCheckDebugged() && _fnJit26PrepareRegion) {
+        emitLog(@"[JIT] Requesting 384 MB TXM RX region from StikDebug (jit26_prepare_region @ 0x148000000)...");
+        void *candRx = _fnJit26PrepareRegion((void *)kTargetLowVa, poolSize);
+        if (candRx != NULL && candRx != MAP_FAILED) {
+            if (_fnJitMakeRegionNoFootprint) {
+                _fnJitMakeRegionNoFootprint(candRx, poolSize, "jit_pool");
+            }
+            vm_address_t rwAddr = 0x300000000ULL;
+            vm_prot_t curProt = 0, maxProt = 0;
+            kern_return_t kr = vm_remap(
+                task,
+                &rwAddr,
+                poolSize,
+                0,
+                VM_FLAGS_ANYWHERE,
+                task,
+                (vm_address_t)candRx,
+                FALSE,
+                &curProt,
+                &maxProt,
+                VM_INHERIT_NONE
+            );
+            if (kr == KERN_SUCCESS) {
+                vm_protect(task, rwAddr, poolSize, FALSE, VM_PROT_READ | VM_PROT_WRITE);
+                rxBase = candRx;
+                rwBase = (void *)rwAddr;
+                if (_fnJit26Detach) {
+                    _fnJit26Detach();
+                }
+                emitLog([NSString stringWithFormat:@"[JIT] Dual-mapped 384 MB TXM JIT pool via StikDebug: RX=0x%llX RW=0x%llX",
+                         (unsigned long long)(uintptr_t)rxBase, (unsigned long long)rwAddr]);
+            }
+        }
+    }
+
+    if (!rxBase || !rwBase) {
+        emitLog(@"[JIT] ⚠️ No se pudo habilitar el pool JIT ejecutable (RX/RW). Asegúrate de iniciar Brama conectado a Xcode (Cmd+R) o con StikDebug activo en iPadOS.");
+        return NO;
+    }
+
+    // Verify dual-mapping coherence and hardware instruction execution (`mov x0, #42; ret`)
+    volatile uint32_t *rwWords = (volatile uint32_t *)rwBase;
+    volatile uint32_t *rxWords = (volatile uint32_t *)rxBase;
+    rwWords[0] = 0xD2800540; // mov x0, #42
+    rwWords[1] = 0xD65F03C0; // ret
+    sys_icache_invalidate(rxBase, 8);
+
+    if (rxWords[0] != 0xD2800540 || rxWords[1] != 0xD65F03C0) {
+        emitLog(@"[JIT] Error: RW -> RX dual-mapped mirror coherence verification failed.");
+        return NO;
+    }
+
+    typedef int64_t (*JitProbeFn)(void);
+    JitProbeFn probeFn = (JitProbeFn)rxBase;
+    int64_t probeResult = probeFn();
+    rwWords[0] = 0;
+    rwWords[1] = 0;
+    sys_icache_invalidate(rxBase, 8);
+
+    if (probeResult != 42) {
+        emitLog([NSString stringWithFormat:@"[JIT] Error: JIT execution probe returned %lld (expected 42).", probeResult]);
+        return NO;
+    }
+
+    g_madeiraJitRxBase = rxBase;
+    g_madeiraJitRwBase = rwBase;
+    g_madeiraJitPoolSize = poolSize;
+
+    intptr_t writeOffset = (intptr_t)((uintptr_t)rwBase - (uintptr_t)rxBase);
+    char rxBuf[32], rwBuf[32], szBuf[32], offBuf[32];
+    snprintf(rxBuf, sizeof(rxBuf), "0x%llx", (unsigned long long)(uintptr_t)rxBase);
+    snprintf(rwBuf, sizeof(rwBuf), "0x%llx", (unsigned long long)(uintptr_t)rwBase);
+    snprintf(szBuf, sizeof(szBuf), "0x%zx", poolSize);
+    snprintf(offBuf, sizeof(offBuf), "0x%llx", (unsigned long long)writeOffset);
+
+    setenv("WINE_IOS_JIT_RX", rxBuf, 1);
+    setenv("WINE_IOS_JIT_RW", rwBuf, 1);
+    setenv("WINE_IOS_JIT_SIZE", szBuf, 1);
+    setenv("MADEIRA_JIT_WRITE_OFFSET", offBuf, 1);
+
+    emitLog([NSString stringWithFormat:@"[JIT] Verified ARM64EC JIT execution (mov x0,#42 -> %lld) • WriteOffset=%s", probeResult, offBuf]);
+    return YES;
+}
+
+- (void)startMadeiraLogTailWithCallback:(nullable BramaLogCallback)callback {
+    [self stopMadeiraLogTail];
+
+    NSArray<NSString *> *docsDirs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    NSString *docsDir = docsDirs.firstObject ?: NSTemporaryDirectory();
+    NSString *logPath = [docsDir stringByAppendingPathComponent:@"madeira-log.txt"];
+
+    _lastLogFileOffset = 0;
+    dispatch_queue_t queue = dispatch_get_global_queue(QOS_CLASS_UTILITY, 0);
+    _logTailTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, queue);
+    dispatch_source_set_timer(_logTailTimer,
+                              dispatch_time(DISPATCH_TIME_NOW, 200 * NSEC_PER_MSEC),
+                              250 * NSEC_PER_MSEC,
+                              50 * NSEC_PER_MSEC);
+
+    __weak typeof(self) weakSelf = self;
+    dispatch_source_set_event_handler(_logTailTimer, ^{
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSDictionary *attrs = [fm attributesOfItemAtPath:logPath error:nil];
+        unsigned long long fileSize = [attrs fileSize];
+        if (fileSize < strongSelf->_lastLogFileOffset) {
+            strongSelf->_lastLogFileOffset = 0;
+        }
+        if (fileSize > strongSelf->_lastLogFileOffset) {
+            NSFileHandle *fh = [NSFileHandle fileHandleForReadingAtPath:logPath];
+            if (fh) {
+                [fh seekToFileOffset:strongSelf->_lastLogFileOffset];
+                NSData *chunk = [fh readDataOfLength:(NSUInteger)std::min<unsigned long long>(fileSize - strongSelf->_lastLogFileOffset, 65536ULL)];
+                strongSelf->_lastLogFileOffset = [fh offsetInFile];
+                [fh closeFile];
+
+                if (chunk.length > 0) {
+                    NSString *text = [[NSString alloc] initWithData:chunk encoding:NSUTF8StringEncoding];
+                    if (!text) {
+                        text = [[NSString alloc] initWithData:chunk encoding:NSISOLatin1StringEncoding];
+                    }
+                    NSArray<NSString *> *lines = [text componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]];
+                    for (NSString *rawLine in lines) {
+                        NSString *trimmed = [rawLine stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+                        if (trimmed.length == 0) continue;
+                        if ([trimmed containsString:@"[WineProc]"] ||
+                            [trimmed containsString:@"[DXMT"] ||
+                            [trimmed containsString:@"dxmt"] ||
+                            [trimmed containsString:@"[winios"] ||
+                            [trimmed containsString:@"SwapChain"] ||
+                            [trimmed containsString:@"Present"] ||
+                            [trimmed containsString:@"Unity"] ||
+                            [trimmed containsString:@"FEX"] ||
+                            [trimmed containsString:@"xtajit"] ||
+                            [trimmed containsString:@"err:"] ||
+                            [trimmed containsString:@"unhandled exception"]) {
+                            if (callback) {
+                                callback(trimmed);
+                            }
+                        }
                     }
                 }
             }
         }
-        // Fallback to RTLD_DEFAULT (in-process linked ARM64 runtime module symbols) when Personal Team AMFI restricts dlopen on Documents/
-        if (probeSymbol && dlsym(RTLD_DEFAULT, probeSymbol) != NULL) {
-            if (loadedNameOut) *loadedNameOut = candidates.firstObject ?: @"builtin.dylib";
-            return RTLD_DEFAULT;
+
+        uint64_t presents = [strongSelf presentedFrameCount];
+        if (presents > 0) {
+            strongSelf->_dxmtSwapchainActive = YES;
+            strongSelf->_dxmtFrameCounter = presents;
+            strongSelf->_runtimeStatus.framesPresented = presents;
         }
-        return (void *)NULL;
+    });
+    dispatch_resume(_logTailTimer);
+}
+
+- (void)stopMadeiraLogTail {
+    if (_logTailTimer) {
+        dispatch_source_cancel(_logTailTimer);
+        _logTailTimer = nil;
+    }
+}
+
+// Helper to migrate imported game directories from Documents/BramaGames into <Documents>/wine/drive_c/Games
+// so Wine's realpath-based unix_to_nt_file_name resolves C:\Games\<GameFolder> inside drive_c.
+- (NSString *)migrateAndResolveGameExecutableForPath:(NSString *)executablePath
+                                          winePrefix:(NSString *)winePrefix
+                                          outWinPath:(NSString **)outWinPath
+                                       outWinWorkDir:(NSString **)outWinWorkDir
+                                         logCallback:(nullable BramaLogCallback)callback {
+    auto emitLog = ^(NSString *msg) {
+        NSLog(@"%@", msg);
+        if (callback) {
+            callback(msg);
+        }
     };
-    
-    // 1. Probe CPU Translation Engine (FEX-Emu / Box64)
-    NSString *cpuMod = nil;
-    _cpuTranslatorHandle = tryLoadDylib(@[@"libbox64.dylib", @"libfex_core.dylib", @"libfex_thunk.dylib"], "box64_version", &cpuMod);
-    if (_cpuTranslatorHandle && cpuMod) {
-        status.cpuTranslatorLoaded = YES;
-        BramaBox64VersionFn verFn = (BramaBox64VersionFn)dlsym(_cpuTranslatorHandle, "box64_version");
-        BramaBox64InitFn initFn = (BramaBox64InitFn)dlsym(_cpuTranslatorHandle, "box64_init");
-        if (initFn) {
-            initFn([self isJITAvailable] ? 1 : 0);
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSArray<NSString *> *docsDirs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    NSString *docsDir = docsDirs.firstObject ?: NSTemporaryDirectory();
+    NSString *bramaGamesDir = [docsDir stringByAppendingPathComponent:@"BramaGames"];
+    NSString *driveCGamesDir = [winePrefix stringByAppendingPathComponent:@"drive_c/Games"];
+    [fm createDirectoryAtPath:driveCGamesDir withIntermediateDirectories:YES attributes:nil error:nil];
+
+    // Migrate real subdirectories from Documents/BramaGames/<Folder> into <winePrefix>/drive_c/Games/<Folder>
+    // and leave a symlink in Documents/BramaGames/<Folder> so existing UI references stay valid.
+    NSArray<NSString *> *importedItems = [fm contentsOfDirectoryAtPath:bramaGamesDir error:nil] ?: @[];
+    for (NSString *item in importedItems) {
+        if ([item hasPrefix:@"."]) continue;
+        NSString *srcPath = [bramaGamesDir stringByAppendingPathComponent:item];
+        NSDictionary *linkAttrs = [fm attributesOfItemAtPath:srcPath error:nil];
+        if ([linkAttrs[NSFileType] isEqualToString:NSFileTypeSymbolicLink]) {
+            continue;
         }
-        const char *verStr = verFn ? verFn() : "ARM64 Dynarec";
-        status.cpuTranslatorModuleName = [NSString stringWithFormat:@"%@ (%s)", cpuMod, verStr];
-        emitLog([NSString stringWithFormat:@"[EXEC] Loaded native ARM64 CPU translator dylib: %@ [%s]", cpuMod, verStr]);
-    } else {
-        status.cpuTranslatorLoaded = YES;
-        status.cpuTranslatorModuleName = @"Brama ARM64 JIT / x86_64 Dynarec Bridge";
-        emitLog(@"[EXEC] CPU Translator: Brama ARM64 JIT / x86_64 Dynarec Bridge active");
-    }
-    
-    // 2. Probe Wine / Win64 Compatibility Layer (libwine / ntdll.dll.so)
-    NSString *wineMod = nil;
-    _wineLibraryHandle = tryLoadDylib(@[@"libwine.dylib", @"libwine.1.dylib", @"ntdll.dll.so"], "wine_get_version", &wineMod);
-    if (_wineLibraryHandle && wineMod) {
-        status.wineRuntimeLoaded = YES;
-        BramaWineVersionFn wineVerFn = (BramaWineVersionFn)dlsym(_wineLibraryHandle, "wine_get_version");
-        BramaWineInitPrefixFn wineInitFn = (BramaWineInitPrefixFn)dlsym(_wineLibraryHandle, "wine_init_prefix");
-        if (wineInitFn) {
-            wineInitFn([prefixPath UTF8String]);
+        BOOL isDir = NO;
+        if ([fm fileExistsAtPath:srcPath isDirectory:&isDir] && isDir) {
+            NSString *dstPath = [driveCGamesDir stringByAppendingPathComponent:item];
+            if (![fm fileExistsAtPath:dstPath]) {
+                NSError *moveErr = nil;
+                if ([fm moveItemAtPath:srcPath toPath:dstPath error:&moveErr]) {
+                    [fm createSymbolicLinkAtPath:srcPath withDestinationPath:dstPath error:nil];
+                    emitLog([NSString stringWithFormat:@"[WINE] Mounted game folder into Wine C:\\Games\\%@", item]);
+                }
+            } else {
+                // Merge contents if destination folder already exists
+                NSArray<NSString *> *subItems = [fm contentsOfDirectoryAtPath:srcPath error:nil] ?: @[];
+                for (NSString *sub in subItems) {
+                    NSString *sFile = [srcPath stringByAppendingPathComponent:sub];
+                    NSString *dFile = [dstPath stringByAppendingPathComponent:sub];
+                    if (![fm fileExistsAtPath:dFile]) {
+                        [fm moveItemAtPath:sFile toPath:dFile error:nil];
+                    }
+                }
+            }
         }
-        const char *wVer = wineVerFn ? wineVerFn() : "Wine-9.0-ARM64";
-        status.wineRuntimeModuleName = [NSString stringWithFormat:@"%@ (%s)", wineMod, wVer];
-        emitLog([NSString stringWithFormat:@"[WINE] Loaded native Wine runtime dylib: %@ [%s]", wineMod, wVer]);
-    } else {
-        status.wineRuntimeLoaded = YES;
-        status.wineRuntimeModuleName = @"WineKit Win64 API Thunk Layer";
-        emitLog(@"[WINE] Wine Subsystem: WineKit Win64 API Thunk Layer initialized");
     }
-    
-    // 3. Probe Graphics Translation Layer (DXMT / D3DMetal / MoltenVK -> Apple Metal)
-    NSString *gfxMod = nil;
-    NSString *gpuName = _metalDevice.name ?: @"Apple Silicon GPU";
-    _dxmtLibraryHandle = tryLoadDylib(@[@"libdxmt.dylib", @"d3d11.dll.so", @"libMoltenVK.dylib"], "dxmt_version", &gfxMod);
-    if (_dxmtLibraryHandle && gfxMod) {
-        status.dxmtMetalLoaded = YES;
-        BramaDXMTVersionFn dxmtVerFn = (BramaDXMTVersionFn)dlsym(_dxmtLibraryHandle, "dxmt_version");
-        BramaDXMTBindMetalFn dxmtBindFn = (BramaDXMTBindMetalFn)dlsym(_dxmtLibraryHandle, "dxmt_bind_metal_device");
-        _dxmtPresentFn = (BramaDXMTPresentFrameFn)dlsym(_dxmtLibraryHandle, "dxmt_present_swapchain");
-        if (dxmtBindFn) {
-            dxmtBindFn([gpuName UTF8String]);
+
+    NSString *exeName = [[executablePath stringByReplacingOccurrencesOfString:@"\\" withString:@"/"] lastPathComponent];
+
+    // Search inside <winePrefix>/drive_c/Games for a matching .exe
+    NSDirectoryEnumerator *driveCEnum = [fm enumeratorAtPath:driveCGamesDir];
+    for (NSString *relPath in driveCEnum) {
+        if ([[relPath lastPathComponent] caseInsensitiveCompare:exeName] == NSOrderedSame) {
+            NSString *fullUnixPath = [driveCGamesDir stringByAppendingPathComponent:relPath];
+            if ([fm fileExistsAtPath:fullUnixPath]) {
+                NSString *winRel = [relPath stringByReplacingOccurrencesOfString:@"/" withString:@"\\"];
+                NSString *winFull = [NSString stringWithFormat:@"C:\\Games\\%@", winRel];
+                NSString *winDir = [winFull stringByDeletingLastPathComponent];
+                if (![winDir hasPrefix:@"C:\\"]) {
+                    NSRange lastBackslash = [winFull rangeOfString:@"\\" options:NSBackwardsSearch];
+                    winDir = (lastBackslash.location != NSNotFound) ? [winFull substringToIndex:lastBackslash.location] : @"C:\\Games";
+                }
+                if (outWinPath) *outWinPath = winFull;
+                if (outWinWorkDir) *outWinWorkDir = winDir;
+                return fullUnixPath;
+            }
         }
-        const char *dVer = dxmtVerFn ? dxmtVerFn() : "DXMT-0.40-Metal";
-        status.dxmtMetalModuleName = [NSString stringWithFormat:@"%@ (%s • %@)", gfxMod, dVer, gpuName];
-        emitLog([NSString stringWithFormat:@"[DXMT] Loaded native DirectX->Metal dylib: %@ [%s] bound to %@", gfxMod, dVer, gpuName]);
-    } else {
-        status.dxmtMetalLoaded = (_metalDevice != nil);
-        status.dxmtMetalModuleName = [NSString stringWithFormat:@"DXMT Metal Pipeline (%@)", gpuName];
-        emitLog([NSString stringWithFormat:@"[DXMT] Bound DirectX 11/12 swapchain to Metal device: %@", gpuName]);
     }
-    
-    self.runtimeStatus = status;
-    return status;
+
+    // Also check if the user imported files flat inside Documents/BramaGames/
+    NSString *flatExe = [bramaGamesDir stringByAppendingPathComponent:exeName];
+    if ([fm fileExistsAtPath:flatExe]) {
+        NSString *folderName = [exeName stringByDeletingPathExtension];
+        NSString *targetGameDir = [driveCGamesDir stringByAppendingPathComponent:folderName];
+        [fm createDirectoryAtPath:targetGameDir withIntermediateDirectories:YES attributes:nil error:nil];
+        for (NSString *item in ([fm contentsOfDirectoryAtPath:bramaGamesDir error:nil] ?: @[])) {
+            if ([item hasPrefix:@"."]) continue;
+            NSString *sPath = [bramaGamesDir stringByAppendingPathComponent:item];
+            NSDictionary *lAttrs = [fm attributesOfItemAtPath:sPath error:nil];
+            if ([lAttrs[NSFileType] isEqualToString:NSFileTypeSymbolicLink]) continue;
+            NSString *dPath = [targetGameDir stringByAppendingPathComponent:item];
+            if (![fm fileExistsAtPath:dPath]) {
+                [fm moveItemAtPath:sPath toPath:dPath error:nil];
+            }
+        }
+        NSString *movedExe = [targetGameDir stringByAppendingPathComponent:exeName];
+        if ([fm fileExistsAtPath:movedExe]) {
+            if (outWinPath) *outWinPath = [NSString stringWithFormat:@"C:\\Games\\%@\\%@", folderName, exeName];
+            if (outWinWorkDir) *outWinWorkDir = [NSString stringWithFormat:@"C:\\Games\\%@", folderName];
+            return movedExe;
+        }
+    }
+
+    // Fallback to standard resolver
+    NSString *resolved = [self resolveWindowsExecutablePath:executablePath prefixPath:winePrefix];
+    NSString *driveCPrefix = [winePrefix stringByAppendingPathComponent:@"drive_c/"];
+    if ([resolved hasPrefix:driveCPrefix]) {
+        NSString *rel = [resolved substringFromIndex:driveCPrefix.length];
+        NSString *winRel = [rel stringByReplacingOccurrencesOfString:@"/" withString:@"\\"];
+        NSString *winFull = [NSString stringWithFormat:@"C:\\%@", winRel];
+        NSRange lastSep = [winFull rangeOfString:@"\\" options:NSBackwardsSearch];
+        NSString *winDir = (lastSep.location != NSNotFound) ? [winFull substringToIndex:lastSep.location] : @"C:\\";
+        if (outWinPath) *outWinPath = winFull;
+        if (outWinWorkDir) *outWinWorkDir = winDir;
+    } else {
+        if (outWinPath) *outWinPath = executablePath;
+        if (outWinWorkDir) *outWinWorkDir = @"C:\\Games";
+    }
+    return resolved;
 }
 
 // ============================================================================
@@ -2006,12 +2641,43 @@ typedef uint64_t (*BramaDXMTPresentFrameFn)(uint64_t frameIndex, float *outClear
         }
     };
     
+    g_activeUILogCallback = [callback copy];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSArray<NSString *> *docsDirs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    NSString *docsDir = docsDirs.firstObject ?: NSTemporaryDirectory();
+
+    NSString *activePrefix = [self isMadeiraEngineLoaded] ? [self canonicalWinePrefixPath] : prefixPath;
     emitLog([NSString stringWithFormat:@"[BRAMA] Preparing Wine64 container for: %@", [executablePath lastPathComponent]]);
-    
-    NSError *error = nil;
-    if (![self prepareWinePrefixAtPath:prefixPath error:&error]) {
-        emitLog([NSString stringWithFormat:@"[BRAMA] Error preparing Wine prefix: %@", error.localizedDescription]);
-        return NO;
+
+    if ([self isMadeiraEngineLoaded]) {
+        // Ensure canonical <Documents>/wine prefix is extracted from prefix-template.tar.gz
+        NSString *timestampFile = [activePrefix stringByAppendingPathComponent:@".update-timestamp"];
+        NSString *systemRegFile = [activePrefix stringByAppendingPathComponent:@"system.reg"];
+        if (![fm fileExistsAtPath:timestampFile] && [fm fileExistsAtPath:systemRegFile]) {
+            // Remove any synthetic system.reg so seed_prefix_if_needed extracts the full Wine template
+            [fm removeItemAtPath:systemRegFile error:nil];
+        }
+        if (_fnSeedPrefixIfNeeded) {
+            emitLog(@"[WINE] Verifying Wine 9.0 ARM64EC prefix template in Documents/wine...");
+            _fnSeedPrefixIfNeeded([activePrefix UTF8String]);
+        }
+
+        // Ensure Documents/madeira.cfg exists with safe defaults
+        NSString *cfgPath = [docsDir stringByAppendingPathComponent:@"madeira.cfg"];
+        if (![fm fileExistsAtPath:cfgPath]) {
+            NSString *defaultCfg =
+                @"# Brama + Madeira Runtime Configuration\n"
+                @"swap-mb = 1024\n"
+                @"swap-min-kb = 1024\n"
+                @"env.MADEIRA_EC_HOOK_TRACE = 0\n";
+            [defaultCfg writeToFile:cfgPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        }
+    } else {
+        NSError *error = nil;
+        if (![self prepareWinePrefixAtPath:activePrefix error:&error]) {
+            emitLog([NSString stringWithFormat:@"[BRAMA] Error preparing Wine prefix: %@", error.localizedDescription]);
+            return NO;
+        }
     }
     
     BOOL jit = [self isJITAvailable];
@@ -2019,23 +2685,36 @@ typedef uint64_t (*BramaDXMTPresentFrameFn)(uint64_t frameIndex, float *outClear
     emitLog([NSString stringWithFormat:@"[JIT] Kernel Entitlements: MAP_JIT=%@ • ExtendedVA=%@",
              jit ? @"GRANTED" : @"FALLBACK", extVA ? @"64-BIT ACTIVE" : @"STANDARD"]);
     
-    // 1. Initialize dynamic emulation libraries (FEX/Box64, Wine, DXMT Metal)
-    [self initializeEmulationSubsystemsWithPrefix:prefixPath logCallback:callback];
+    // 1. Initialize dynamic emulation libraries (Madeira Wine ARM64EC + FEX-Emu + DXMT Metal)
+    [self initializeEmulationSubsystemsWithPrefix:activePrefix logCallback:callback];
     
-    // 2. Resolve Windows path to physical sandbox .exe path & load/map PE32+ image
-    NSString *resolvedExePath = [self resolveWindowsExecutablePath:executablePath prefixPath:prefixPath];
+    // 2. Migrate & resolve Windows path into <activePrefix>/drive_c/Games/<GameFolder>
+    NSString *winExePath = nil;
+    NSString *winWorkDir = nil;
+    NSString *resolvedExePath = [self migrateAndResolveGameExecutableForPath:executablePath
+                                                                  winePrefix:activePrefix
+                                                                  outWinPath:&winExePath
+                                                               outWinWorkDir:&winWorkDir
+                                                                 logCallback:callback];
+
     BramaPEExecutableInfo *peInfo = [self loadAndMapPEExecutableAtPath:resolvedExePath logCallback:callback];
     if (!peInfo) {
         emitLog(@"[EXEC] Failed to load PE executable headers.");
         return NO;
     }
     
-    // 3. Recursively load and map dependent non-system PE32+ DLLs (e.g. UnityPlayer.dll) & link Export Table -> IAT
-    NSFileManager *fm = [NSFileManager defaultManager];
+    // 3. Inspect dependent non-system PE32+ DLLs (e.g. UnityPlayer.dll)
     NSString *gameDir = [resolvedExePath stringByDeletingLastPathComponent];
-    NSArray<NSString *> *docsDirs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-    NSString *docsDir = docsDirs.firstObject ?: NSTemporaryDirectory();
     NSString *bramaGamesDir = [docsDir stringByAppendingPathComponent:@"BramaGames"];
+
+    // Clean up any old 4KB synthetic UnityPlayer.dll shim from system32 if present
+    NSString *sys32UnityShim = [activePrefix stringByAppendingPathComponent:@"drive_c/windows/system32/UnityPlayer.dll"];
+    if ([fm fileExistsAtPath:sys32UnityShim]) {
+        NSDictionary *shimAttrs = [fm attributesOfItemAtPath:sys32UnityShim error:nil];
+        if ([shimAttrs fileSize] <= 16384) {
+            [fm removeItemAtPath:sys32UnityShim error:nil];
+        }
+    }
 
     NSSet<NSString *> *systemDLLs = [NSSet setWithObjects:
         @"kernel32.dll", @"user32.dll", @"gdi32.dll", @"advapi32.dll",
@@ -2047,11 +2726,12 @@ typedef uint64_t (*BramaDXMTPresentFrameFn)(uint64_t frameIndex, float *outClear
         if (![systemDLLs containsObject:dll.lowercaseString]) {
             NSString *dllPath = [gameDir stringByAppendingPathComponent:dll];
             if (![fm fileExistsAtPath:dllPath]) {
-                // Search recursively inside Documents/BramaGames in case the DLL was imported in a sibling folder
                 NSDirectoryEnumerator *enumerator = [fm enumeratorAtPath:bramaGamesDir];
                 for (NSString *relPath in enumerator) {
                     if ([[relPath lastPathComponent] caseInsensitiveCompare:dll] == NSOrderedSame) {
-                        dllPath = [bramaGamesDir stringByAppendingPathComponent:relPath];
+                        NSString *foundDll = [bramaGamesDir stringByAppendingPathComponent:relPath];
+                        // Copy into gameDir so Wine's loader finds it next to the .exe
+                        [fm copyItemAtPath:foundDll toPath:dllPath error:nil];
                         break;
                     }
                 }
@@ -2062,19 +2742,107 @@ typedef uint64_t (*BramaDXMTPresentFrameFn)(uint64_t frameIndex, float *outClear
                 unsigned long long dllSizeKB = [attrs fileSize] / 1024;
                 emitLog([NSString stringWithFormat:@"[WINE] Found native game DLL '%@' (%llu KB) in container.", dll, dllSizeKB]);
                 [self loadAndMapPEDLLAtPath:dllPath logCallback:callback];
-            } else {
-                // Provision WineKit PE32+ Shim DLL in system32 with real Export Directory Table so UnityMain resolves cleanly
-                NSString *shimPath = [prefixPath stringByAppendingPathComponent:
+            } else if (![self isMadeiraEngineLoaded]) {
+                NSString *shimPath = [activePrefix stringByAppendingPathComponent:
                     [NSString stringWithFormat:@"drive_c/windows/system32/%@", dll]];
                 [self ensureValidPE32PlusShimDLLAtPath:shimPath moduleName:dll];
-                emitLog([NSString stringWithFormat:@"[WINE] Notice: '%@' not in game folder; loading WineKit PE32+ Shim '%@' (Import complete game folder for native DLL).",
-                         dll, dll]);
                 [self loadAndMapPEDLLAtPath:shimPath logCallback:callback];
+            } else {
+                emitLog([NSString stringWithFormat:@"[WINE] ⚠️ Falta '%@' junto al ejecutable (%@). Asegúrate de importar la carpeta completa del juego.",
+                         dll, gameDir]);
             }
         }
     }
 
-    // Link IAT Thunk entries to resolved Export Table VAs from loaded DLLs
+    // 4. If Madeira Wine ARM64EC engine is loaded, unmap temporary PE inspection buffers and launch real Wine process!
+    if ([self isMadeiraEngineLoaded]) {
+        if (_mappedPEImageBase && _mappedPEImageSize > 0) {
+            munmap(_mappedPEImageBase, _mappedPEImageSize);
+            _mappedPEImageBase = NULL;
+            _mappedPEImageSize = 0;
+        }
+        for (const auto &reg : _mappedDLLRegions) {
+            if (reg.baseAddress && reg.mappedSize > 0) {
+                munmap(reg.baseAddress, reg.mappedSize);
+            }
+        }
+        _mappedDLLRegions.clear();
+
+        // Initialize the 384MB dual-mapped ARM64EC JIT pool (RX @ 0x148000000, RW @ 0x300000000)
+        BOOL jitReady = [self ensureMadeiraJITPoolInitializedWithLogCallback:callback];
+        if (!jitReady) {
+            emitLog(@"[JIT] ⚠️ Abortando lanzamiento nativo: el kernel de iPadOS requiere ejecutar la app desde Xcode (Run) o StikDebug para activar CS_DEBUGGED / JIT.");
+            return NO;
+        }
+
+        // Stop any previous Wine process / wineserver before starting a fresh session
+        if (_fnWineserverIsRunning && _fnWineserverIsRunning()) {
+            emitLog(@"[WINE] Stopping previous wineserver session...");
+            if (_fnWineserverStop) {
+                _fnWineserverStop();
+            }
+            for (int i = 0; i < 30; ++i) {
+                if (!_fnWineserverIsRunning()) break;
+                usleep(100 * 1000);
+            }
+        }
+
+        [self configureEnvironment];
+        setenv("WINEPREFIX", [activePrefix UTF8String], 1);
+        setenv("MADEIRA_EXE", [winExePath UTF8String], 1);
+        setenv("MADEIRA_WORKDIR", [winWorkDir UTF8String], 1);
+        setenv("MADEIRA_USE_ARM64EC", "1", 1);
+        setenv("MADEIRA_EC_HOOK_TRACE", "0", 1);
+        setenv("MADEIRA_SCREEN_W", "1280", 1);
+        setenv("MADEIRA_SCREEN_H", "720", 1);
+        if (arguments.length > 0) {
+            setenv("MADEIRA_ARGS", [arguments UTF8String], 1);
+            emitLog([NSString stringWithFormat:@"[WINE] Passing launch arguments: %@", arguments]);
+        } else {
+            unsetenv("MADEIRA_ARGS");
+        }
+        setenv("MADEIRA_ENV_LOCKED", "1", 1);
+
+        if (_fnWiniosDisplayModeChanged) {
+            _fnWiniosDisplayModeChanged(1280, 720);
+        }
+        if (_registeredMetalLayer && _fnDisplaySetLayer) {
+            _fnDisplaySetLayer(_registeredMetalLayer);
+        }
+
+        emitLog([NSString stringWithFormat:@"[WINE] Starting in-process wineserver for prefix: %@", activePrefix]);
+        if (_fnWineserverStart) {
+            _fnWineserverStart([activePrefix UTF8String]);
+        }
+
+        // Wait up to 5 seconds for wineserver event loop readiness
+        BOOL serverReady = NO;
+        for (int waitIdx = 0; waitIdx < 100; ++waitIdx) {
+            if (_fnWineserverIsReady && _fnWineserverIsReady() != 0) {
+                serverReady = YES;
+                break;
+            }
+            usleep(50 * 1000);
+        }
+        emitLog([NSString stringWithFormat:@"[WINE] wineserver status: %@ • Launching %@ (workdir: %@)",
+                 serverReady ? @"READY" : @"STARTING", winExePath, winWorkDir]);
+
+        [self startMadeiraLogTailWithCallback:callback];
+
+        if (_fnWineProcessStart) {
+            int rc = _fnWineProcessStart([activePrefix UTF8String]);
+            if (rc != 0) {
+                emitLog([NSString stringWithFormat:@"[WINE] Error starting Wine process thread (rc=%d)", rc]);
+                return NO;
+            }
+        }
+
+        _isRunning = YES;
+        emitLog(@"[DXMT] Wine ARM64EC + FEX-Emu + DXMT Metal pipeline active — waiting for game window swapchain...");
+        return YES;
+    }
+
+    // Fallback when running on Simulator
     for (auto &thunk : _iatThunkTable) {
         auto it = _exportedSymbolAddressMap.find(thunk.symbolName);
         if (it != _exportedSymbolAddressMap.end()) {
@@ -2083,14 +2851,7 @@ typedef uint64_t (*BramaDXMTPresentFrameFn)(uint64_t frameIndex, float *outClear
                      thunk.dllName.c_str(), thunk.symbolName.c_str(), thunk.thunkVA, thunk.resolvedExportVA]);
         }
     }
-    
-    if (arguments.length > 0) {
-        emitLog([NSString stringWithFormat:@"[WINE] Passing launch arguments: %@", arguments]);
-    }
-    
-    // 4. Translate and execute the PE entry point block & Win64 CRT / UnityMain flow
     [self executeTranslatedEntryPointForPE:peInfo jitEnabled:jit logCallback:callback];
-    
     _isRunning = YES;
     return YES;
 }
@@ -2098,6 +2859,10 @@ typedef uint64_t (*BramaDXMTPresentFrameFn)(uint64_t frameIndex, float *outClear
 - (void)terminateActiveProcess {
     _isRunning = NO;
     _dxmtSwapchainActive = NO;
+    [self stopMadeiraLogTail];
+    if (_fnWineserverIsRunning && _fnWineserverIsRunning() && _fnWineserverStop) {
+        _fnWineserverStop();
+    }
     if (_mappedPEImageBase && _mappedPEImageSize > 0) {
         munmap(_mappedPEImageBase, _mappedPEImageSize);
         _mappedPEImageBase = NULL;

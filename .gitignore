@@ -49,3 +49,6 @@ Carthage/Build/
 *.bak
 *~
 *.orig
+
+# Large prebuilt Madeira iOS runtime binary assets (staged via scripts/setup-madeira-runtime.sh)
+MadeiraRuntime/
