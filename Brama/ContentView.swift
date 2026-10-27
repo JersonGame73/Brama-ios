@@ -11,27 +11,33 @@ import Combine
 struct ContentView: View {
     @StateObject private var perfManager = PerformanceManager.shared
     @StateObject private var controllerManager = ControllerManager.shared
+    @StateObject private var storageManager = GameStorageManager.shared
     
-    @State private var games: [GameTitle] = GameTitle.samples
     @State private var selectedGame: GameTitle = GameTitle.samples[0]
     @State private var selectedCategoryIndex: Int = 0
     @State private var showQuickAccessMenu: Bool = false
+    @State private var showGameSettings: Bool = false
+    @State private var showAddGameModal: Bool = false
     @State private var isGameRunning: Bool = false
     @State private var currentTimeString: String = ""
     
     private let categories = ["Todos", "Verificados", "Instalados", "Recientes"]
     private let timer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
     
+    var currentGamesList: [GameTitle] {
+        storageManager.games.isEmpty ? GameTitle.samples : storageManager.games
+    }
+    
     var filteredGames: [GameTitle] {
         switch selectedCategoryIndex {
         case 1:
-            return games.filter { $0.compatibility == .verified }
+            return currentGamesList.filter { $0.compatibility == .verified }
         case 2:
-            return games.filter { $0.isInstalled }
+            return currentGamesList.filter { $0.isInstalled }
         case 3:
-            return games.sorted { $0.hoursPlayed > $1.hoursPlayed }
+            return currentGamesList.sorted { $0.hoursPlayed > $1.hoursPlayed }
         default:
-            return games
+            return currentGamesList
         }
     }
     
@@ -60,7 +66,7 @@ struct ContentView: View {
                         // Hero Game Banner
                         heroGameBanner(game: selectedGame)
                         
-                        // Categories Shelf
+                        // Categories Shelf & Add Game Button
                         categoryTabs
                         
                         // Horizontal Game Cards Shelf
@@ -107,14 +113,28 @@ struct ContentView: View {
         }
         .onAppear {
             updateTime()
+            if let first = currentGamesList.first {
+                selectedGame = first
+            }
         }
         .onReceive(timer) { _ in
             updateTime()
         }
+        .onChange(of: storageManager.games) { newGames in
+            if !newGames.contains(where: { $0.id == selectedGame.id }), let first = newGames.first {
+                selectedGame = first
+            }
+        }
+        .sheet(isPresented: $showGameSettings) {
+            GameSettingsView(game: $selectedGame)
+        }
+        .sheet(isPresented: $showAddGameModal) {
+            AddGameView()
+        }
         .alert(isPresented: $isGameRunning) {
             Alert(
                 title: Text("Iniciando \(selectedGame.title)"),
-                message: Text("Motor: \(selectedGame.translationEngine.rawValue)\nGráficos: \(selectedGame.graphicsBackend.rawValue)\nJIT: \(perfManager.isJITEnabled ? "Habilitado" : "Deshabilitado")"),
+                message: Text("Motor: \(selectedGame.translationEngine.rawValue)\nGráficos: \(selectedGame.graphicsBackend.rawValue)\nResolución: \(selectedGame.screenResolution)\nEjecutable: \(selectedGame.executablePath)\nJIT: \(perfManager.isJITEnabled ? "Habilitado" : "Deshabilitado")"),
                 dismissButton: .default(Text("Entendido"))
             )
         }
@@ -143,6 +163,23 @@ struct ContentView: View {
             }
             
             Spacer()
+            
+            // Add Game Shortcut Button
+            Button(action: {
+                showAddGameModal = true
+            }) {
+                HStack(spacing: 6) {
+                    Image(systemName: "plus.circle.fill")
+                        .font(.system(size: 13, weight: .bold))
+                    Text("Añadir Juego")
+                        .font(.system(size: 12, weight: .bold))
+                }
+                .foregroundColor(.white)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+                .background(Color(red: 0.1, green: 0.62, blue: 1.0))
+                .cornerRadius(16)
+            }
             
             // System Status (Time, Battery, Wifi)
             HStack(spacing: 14) {
@@ -254,7 +291,7 @@ struct ContentView: View {
             
             // Soft overlay gradient for text readability
             LinearGradient(
-                colors: [Color.clear, Color.black.opacity(0.85)],
+                colors: [Color.clear, Color.black.opacity(0.88)],
                 startPoint: .top,
                 endPoint: .bottom
             )
@@ -276,6 +313,10 @@ struct ContentView: View {
                             .foregroundColor(game.compatibility.color)
                         
                         Text("•  \(game.translationEngine.rawValue)")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundColor(.white.opacity(0.7))
+                        
+                        Text("•  \(game.screenResolution)")
                             .font(.system(size: 11, weight: .medium))
                             .foregroundColor(.white.opacity(0.7))
                     }
@@ -306,28 +347,46 @@ struct ContentView: View {
                 
                 Spacer()
                 
-                // Big "JUGAR" Button
-                Button(action: {
-                    isGameRunning = true
-                }) {
-                    HStack(spacing: 10) {
-                        Image(systemName: "play.fill")
-                            .font(.system(size: 16, weight: .black))
-                        Text("JUGAR")
-                            .font(.system(size: 16, weight: .black, design: .rounded))
+                // Action Buttons (Play & Wine Settings)
+                HStack(spacing: 12) {
+                    Button(action: {
+                        showGameSettings = true
+                    }) {
+                        Image(systemName: "gearshape.fill")
+                            .font(.system(size: 16, weight: .bold))
+                            .foregroundColor(.white)
+                            .frame(width: 48, height: 48)
+                            .background(Color.white.opacity(0.12))
+                            .cornerRadius(12)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 12)
+                                    .stroke(Color.white.opacity(0.2), lineWidth: 1)
+                            )
                     }
-                    .foregroundColor(.white)
-                    .padding(.horizontal, 28)
-                    .padding(.vertical, 14)
-                    .background(
-                        LinearGradient(
-                            colors: [Color(red: 0.18, green: 0.8, blue: 0.44), Color(red: 0.13, green: 0.65, blue: 0.35)],
-                            startPoint: .top,
-                            endPoint: .bottom
+                    
+                    // Big "JUGAR" Button
+                    Button(action: {
+                        isGameRunning = true
+                    }) {
+                        HStack(spacing: 10) {
+                            Image(systemName: "play.fill")
+                                .font(.system(size: 16, weight: .black))
+                            Text("JUGAR")
+                                .font(.system(size: 16, weight: .black, design: .rounded))
+                        }
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 28)
+                        .padding(.vertical, 14)
+                        .background(
+                            LinearGradient(
+                                colors: [Color(red: 0.18, green: 0.8, blue: 0.44), Color(red: 0.13, green: 0.65, blue: 0.35)],
+                                startPoint: .top,
+                                endPoint: .bottom
+                            )
                         )
-                    )
-                    .cornerRadius(12)
-                    .shadow(color: Color(red: 0.18, green: 0.8, blue: 0.44).opacity(0.4), radius: 10, x: 0, y: 4)
+                        .cornerRadius(12)
+                        .shadow(color: Color(red: 0.18, green: 0.8, blue: 0.44).opacity(0.4), radius: 10, x: 0, y: 4)
+                    }
                 }
             }
             .padding(24)
@@ -356,13 +415,15 @@ struct ContentView: View {
                         .cornerRadius(20)
                 }
             }
+            
+            Spacer()
         }
     }
     
     // MARK: - Games Horizontal Shelf
     private var gamesHorizontalShelf: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("BIBLIOTECA PRINCIPAL")
+            Text("BIBLIOTECA PRINCIPAL (\(filteredGames.count))")
                 .font(.system(size: 12, weight: .bold))
                 .foregroundColor(.gray)
             
@@ -389,9 +450,26 @@ struct ContentView: View {
     private var bottomControllerBar: some View {
         HStack(spacing: 24) {
             ControllerButtonLegend(buttonLabel: "A", text: "Jugar / Seleccionar", color: .green)
-            ControllerButtonLegend(buttonLabel: "X", text: "Opciones de Wine", color: .blue)
-            ControllerButtonLegend(buttonLabel: "Y", text: "Buscar Juego", color: .yellow)
-            ControllerButtonLegend(buttonLabel: "...", text: "Menú Rápido", color: .gray)
+            
+            Button(action: {
+                showGameSettings = true
+            }) {
+                ControllerButtonLegend(buttonLabel: "X", text: "Opciones de Wine", color: .blue)
+            }
+            
+            Button(action: {
+                showAddGameModal = true
+            }) {
+                ControllerButtonLegend(buttonLabel: "Y", text: "Añadir Juego", color: .yellow)
+            }
+            
+            Button(action: {
+                withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+                    showQuickAccessMenu.toggle()
+                }
+            }) {
+                ControllerButtonLegend(buttonLabel: "...", text: "Menú Rápido", color: .gray)
+            }
             
             Spacer()
             
