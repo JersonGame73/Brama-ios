@@ -18,7 +18,7 @@ struct ContentView: View {
     @State private var showQuickAccessMenu: Bool = false
     @State private var showGameSettings: Bool = false
     @State private var showAddGameModal: Bool = false
-    @State private var isGameRunning: Bool = false
+    @State private var runningGame: GameTitle? = nil
     @State private var currentTimeString: String = ""
     
     private let categories = ["Todos", "Verificados", "Instalados", "Recientes"]
@@ -127,8 +127,8 @@ struct ContentView: View {
         .sheet(isPresented: $showAddGameModal) {
             AddGameView()
         }
-        .fullScreenCover(isPresented: $isGameRunning) {
-            GameSessionView(game: selectedGame)
+        .fullScreenCover(item: $runningGame) { gameToLaunch in
+            GameSessionView(game: gameToLaunch)
         }
         .preferredColorScheme(.dark)
         .statusBarHidden(true)
@@ -354,7 +354,7 @@ struct ContentView: View {
                     
                     // Big "JUGAR" Button
                     Button(action: {
-                        isGameRunning = true
+                        runningGame = game
                     }) {
                         HStack(spacing: 10) {
                             Image(systemName: "play.fill")
@@ -411,7 +411,7 @@ struct ContentView: View {
     // MARK: - Games Horizontal Shelf
     private var gamesHorizontalShelf: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("BIBLIOTECA PRINCIPAL (\(filteredGames.count))")
+            Text("BIBLIOTECA PRINCIPAL (\(filteredGames.count)) • Toca 2 veces o pulsa ▶ para abrir")
                 .font(.system(size: 12, weight: .bold))
                 .foregroundColor(.gray)
             
@@ -420,11 +420,19 @@ struct ContentView: View {
                     ForEach(filteredGames) { game in
                         GameCardView(
                             game: game,
-                            isSelected: selectedGame.id == game.id
+                            isSelected: selectedGame.id == game.id,
+                            onPlayPressed: {
+                                selectedGame = game
+                                runningGame = game
+                            }
                         )
                         .onTapGesture {
-                            withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) {
-                                selectedGame = game
+                            if selectedGame.id == game.id {
+                                runningGame = game
+                            } else {
+                                withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) {
+                                    selectedGame = game
+                                }
                             }
                         }
                     }
@@ -437,7 +445,11 @@ struct ContentView: View {
     // MARK: - Bottom Controller Bar
     private var bottomControllerBar: some View {
         HStack(spacing: 24) {
-            ControllerButtonLegend(buttonLabel: "A", text: "Jugar / Seleccionar", color: .green)
+            Button(action: {
+                runningGame = selectedGame
+            }) {
+                ControllerButtonLegend(buttonLabel: "A", text: "Jugar / Seleccionar", color: .green)
+            }
             
             Button(action: {
                 showGameSettings = true
@@ -541,6 +553,7 @@ struct ContentView: View {
 fileprivate struct GameCardView: View {
     let game: GameTitle
     let isSelected: Bool
+    var onPlayPressed: (() -> Void)? = nil
     
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -568,7 +581,7 @@ fileprivate struct GameCardView: View {
                         y: 4
                     )
                 
-                // Icon
+                // Icon & Quick Play Button on Selected Card
                 VStack {
                     HStack {
                         Spacer()
@@ -578,6 +591,26 @@ fileprivate struct GameCardView: View {
                             .padding(10)
                     }
                     Spacer()
+                    
+                    if isSelected {
+                        Button(action: {
+                            onPlayPressed?()
+                        }) {
+                            HStack(spacing: 6) {
+                                Image(systemName: "play.fill")
+                                    .font(.system(size: 11, weight: .black))
+                                Text("JUGAR")
+                                    .font(.system(size: 11, weight: .black, design: .rounded))
+                            }
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 8)
+                            .background(Color(red: 0.18, green: 0.8, blue: 0.44))
+                            .cornerRadius(20)
+                            .shadow(color: .black.opacity(0.6), radius: 6, x: 0, y: 2)
+                        }
+                        .padding(.bottom, 42)
+                    }
                 }
                 .frame(width: 150, height: 210)
                 

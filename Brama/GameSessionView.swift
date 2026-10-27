@@ -23,11 +23,22 @@ struct GameSessionView: View {
     @State private var loadedPEInfo: BramaPEExecutableInfo? = nil
     @State private var runtimeStatus: BramaRuntimeModulesStatus? = nil
     
+    // Interactive 60 FPS Sandbox / Character State
+    @State private var avatarOffset: CGSize = .zero
+    @State private var avatarVelocityY: CGFloat = 0
+    @State private var facingRight: Bool = true
+    @State private var isSlashing: Bool = false
+    @State private var isFocusingSoul: Bool = false
+    @State private var soulCharge: Double = 0.75
+    @State private var hitCounter: Int = 0
+    @State private var targetDummyOffset: CGFloat = 95
+    @State private var dummyHitFlash: Bool = false
+    
     private let renderTimer = Timer.publish(every: 1.0 / 60.0, on: .main, in: .common).autoconnect()
     
     var body: some View {
         ZStack {
-            // Absolute Solid Black Background (Prevents any white flash in Light Mode)
+            // Absolute Solid Black Background
             Color.black
                 .ignoresSafeArea()
             
@@ -35,11 +46,9 @@ struct GameSessionView: View {
             MetalViewportView()
                 .ignoresSafeArea()
             
-            // Virtual Game Display Screen (Active when boot finishes)
-            if isBootSequenceFinished {
-                virtualGameScreenView
-                    .transition(.opacity)
-            }
+            // Virtual Game Display Screen (Always visible, transitions from boot to interactive arena)
+            virtualGameScreenView
+                .transition(.opacity)
             
             // In-Game Boot Terminal / Loader Console
             if showBootConsole {
@@ -132,81 +141,277 @@ struct GameSessionView: View {
         .onDisappear {
             BramaCore.shared().terminateActiveProcess()
         }
+        .onChange(of: controllerManager.actionPulseID) { _ in
+            handleControllerAction(controllerManager.lastButtonPressed)
+        }
         .onReceive(renderTimer) { _ in
-            frameCounter += 1
+            frameCounter &+= 1
+            updatePhysicsTick()
         }
     }
     
-    // MARK: - Virtual Game Screen Display
+    // MARK: - Interactive 60 FPS Virtual Game Screen Display
     private var virtualGameScreenView: some View {
         ZStack {
-            // Game Artwork Canvas
-            RoundedRectangle(cornerRadius: 12)
+            // 16:10 Viewport Frame
+            RoundedRectangle(cornerRadius: 14)
                 .fill(
                     LinearGradient(
-                        colors: game.bannerGradient,
+                        colors: game.bannerGradient + [Color(red: 0.04, green: 0.06, blue: 0.11)],
                         startPoint: .topLeading,
                         endPoint: .bottomTrailing
                     )
                 )
                 .aspectRatio(16/10, contentMode: .fit)
                 .overlay(
-                    // Scanline / CRT effect
-                    VStack(spacing: 4) {
-                        ForEach(0..<40, id: \.self) { _ in
-                            Divider()
-                                .background(Color.black.opacity(0.12))
+                    ZStack {
+                        // Subtle atmospheric particles
+                        ForEach(0..<8, id: \.self) { idx in
+                            let phase = Double(frameCounter) * 0.025 + Double(idx) * 1.1
+                            Circle()
+                                .fill(Color.white.opacity(0.18))
+                                .frame(width: 6, height: 6)
+                                .offset(
+                                    x: CGFloat(cos(phase) * 180.0) + CGFloat(idx * 25 - 90),
+                                    y: CGFloat(sin(phase * 0.8) * 70.0)
+                                )
+                        }
+                        
+                        // Top-left In-Game Soul / Health HUD inside the viewport
+                        VStack {
+                            HStack(spacing: 12) {
+                                // Soul Vessel Orb
+                                ZStack {
+                                    Circle()
+                                        .fill(Color.black.opacity(0.65))
+                                        .frame(width: 42, height: 42)
+                                    Circle()
+                                        .trim(from: 0, to: soulCharge)
+                                        .stroke(Color.cyan, lineWidth: 4)
+                                        .rotationEffect(.degrees(-90))
+                                        .frame(width: 34, height: 34)
+                                    Image(systemName: game.systemIcon)
+                                        .font(.system(size: 15, weight: .bold))
+                                        .foregroundColor(.white)
+                                }
+                                
+                                VStack(alignment: .leading, spacing: 4) {
+                                    // 5 Masks / Health pips
+                                    HStack(spacing: 5) {
+                                        ForEach(0..<5, id: \.self) { _ in
+                                            Capsule()
+                                                .fill(Color.white)
+                                                .frame(width: 10, height: 14)
+                                                .shadow(color: .cyan.opacity(0.6), radius: 3)
+                                        }
+                                    }
+                                    Text("\(game.title.uppercased()) • GOLPES: \(hitCounter)")
+                                        .font(.system(size: 10, weight: .heavy, design: .monospaced))
+                                        .foregroundColor(.white.opacity(0.85))
+                                }
+                                
+                                Spacer()
+                                
+                                // Live Controller Input Indicator
+                                HStack(spacing: 6) {
+                                    Circle()
+                                        .fill(Color.green)
+                                        .frame(width: 7, height: 7)
+                                    Text("INPUT: \(controllerManager.lastButtonPressed)")
+                                        .font(.system(size: 11, weight: .bold, design: .monospaced))
+                                        .foregroundColor(.cyan)
+                                }
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 5)
+                                .background(Color.black.opacity(0.7))
+                                .cornerRadius(8)
+                            }
+                            .padding(16)
+                            
+                            Spacer()
+                        }
+                        
+                        // Arena Floor Platform
+                        VStack {
+                            Spacer()
+                            ZStack {
+                                RoundedRectangle(cornerRadius: 6)
+                                    .fill(Color.black.opacity(0.55))
+                                    .frame(height: 18)
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 6)
+                                            .stroke(Color.cyan.opacity(0.45), lineWidth: 1)
+                                    )
+                            }
+                            .padding(.horizontal, 36)
+                            .padding(.bottom, 64)
+                        }
+                        
+                        // Interactive Target Crystal / Enemy Dummy
+                        VStack(spacing: 4) {
+                            Image(systemName: "rhombus.fill")
+                                .font(.system(size: 30))
+                                .foregroundColor(dummyHitFlash ? .white : .orange)
+                                .scaleEffect(dummyHitFlash ? 1.3 : 1.0)
+                                .shadow(color: dummyHitFlash ? .white : .orange, radius: 10)
+                            Text("OBJETIVO")
+                                .font(.system(size: 8, weight: .bold, design: .monospaced))
+                                .foregroundColor(.orange.opacity(0.9))
+                        }
+                        .offset(x: targetDummyOffset, y: 38)
+                        
+                        // Playable Hero Avatar (Moves with D-Pad / Stick, Jumps with A, Attacks with X, Focuses with Y)
+                        ZStack {
+                            if isFocusingSoul {
+                                Circle()
+                                    .stroke(Color.cyan, lineWidth: 3)
+                                    .frame(width: 68, height: 68)
+                                    .shadow(color: .cyan, radius: 12)
+                            }
+                            
+                            // Nail Slash Arc when pressing X
+                            if isSlashing {
+                                Capsule()
+                                    .fill(
+                                        LinearGradient(
+                                            colors: [.white, .cyan],
+                                            startPoint: .leading,
+                                            endPoint: .trailing
+                                        )
+                                    )
+                                    .frame(width: 66, height: 14)
+                                    .offset(x: facingRight ? 42 : -42, y: 0)
+                                    .shadow(color: .cyan, radius: 8)
+                            }
+                            
+                            // Hero Body
+                            VStack(spacing: 2) {
+                                ZStack {
+                                    Circle()
+                                        .fill(Color.white)
+                                        .frame(width: 34, height: 34)
+                                        .shadow(color: .cyan.opacity(0.8), radius: 8)
+                                    
+                                    // Eyes facing direction
+                                    HStack(spacing: 5) {
+                                        Circle()
+                                            .fill(Color.black)
+                                            .frame(width: 6, height: 8)
+                                        Circle()
+                                            .fill(Color.black)
+                                            .frame(width: 6, height: 8)
+                                    }
+                                    .offset(x: facingRight ? 4 : -4, y: 1)
+                                }
+                                
+                                RoundedRectangle(cornerRadius: 4)
+                                    .fill(Color(red: 0.15, green: 0.22, blue: 0.35))
+                                    .frame(width: 22, height: 18)
+                            }
+                        }
+                        .offset(x: avatarOffset.width, y: 34 + avatarOffset.height)
+                        
+                        // Bottom Runtime Telemetry Bar inside Viewport
+                        VStack {
+                            Spacer()
+                            HStack(spacing: 12) {
+                                if let pe = loadedPEInfo {
+                                    Text(String(format: "PE32+ @ 0x%llX • ENTRY 0x%04X",
+                                                pe.mappedBaseAddress, pe.entryPointRVA))
+                                        .font(.system(size: 10, weight: .bold, design: .monospaced))
+                                        .foregroundColor(.cyan)
+                                }
+                                
+                                Spacer()
+                                
+                                Text("Controles: [D-Pad] Mover • [A] Saltar • [X] Atacar • [B] Dash • [Y] Energía")
+                                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                                    .foregroundColor(.white.opacity(0.85))
+                            }
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 7)
+                            .background(Color.black.opacity(0.75))
+                            .cornerRadius(8)
+                            .padding(.horizontal, 20)
+                            .padding(.bottom, 12)
                         }
                     }
                 )
                 .overlay(
-                    RoundedRectangle(cornerRadius: 12)
-                        .stroke(Color.white.opacity(0.2), lineWidth: 1)
+                    RoundedRectangle(cornerRadius: 14)
+                        .stroke(Color.white.opacity(0.22), lineWidth: 1.5)
                 )
-                .padding(24)
-            
-            // In-Game Center Title & Render Status + PE32+ Telemetry Badge
-            VStack(spacing: 10) {
-                Text(game.title)
-                    .font(.system(size: 32, weight: .heavy, design: .rounded))
-                    .foregroundColor(.white)
-                    .shadow(color: .black.opacity(0.8), radius: 8, x: 0, y: 4)
-                
-                HStack(spacing: 8) {
-                    Circle()
-                        .fill(Color.green)
-                        .frame(width: 8, height: 8)
-                    Text("VENTANA ACTIVA • \(game.screenResolution)")
-                        .font(.system(size: 12, weight: .bold, design: .monospaced))
-                        .foregroundColor(.white.opacity(0.9))
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 5)
-                .background(Color.black.opacity(0.65))
-                .cornerRadius(12)
-                
-                if let pe = loadedPEInfo {
-                    VStack(spacing: 4) {
-                        Text(String(format: "PE32+ MAPPED @ 0x%llX • ENTRY RVA 0x%04X • %@",
-                                    pe.mappedBaseAddress, pe.entryPointRVA, pe.architectureName))
-                            .font(.system(size: 10, weight: .bold, design: .monospaced))
-                            .foregroundColor(.cyan)
-                        
-                        if !pe.importedDLLs.isEmpty {
-                            Text("DLLs: \(pe.importedDLLs.joined(separator: " • "))")
-                                .font(.system(size: 10, weight: .medium, design: .monospaced))
-                                .foregroundColor(.white.opacity(0.75))
-                        }
+                .padding(.horizontal, 24)
+                .padding(.vertical, 18)
+        }
+    }
+    
+    // MARK: - Controller & Physics Engine
+    private func handleControllerAction(_ button: String) {
+        switch button {
+        case "IZQUIERDA":
+            facingRight = false
+            withAnimation(.interactiveSpring(response: 0.18, dampingFraction: 0.8)) {
+                avatarOffset.width = max(-190, avatarOffset.width - 28)
+            }
+        case "DERECHA":
+            facingRight = true
+            withAnimation(.interactiveSpring(response: 0.18, dampingFraction: 0.8)) {
+                avatarOffset.width = min(190, avatarOffset.width + 28)
+            }
+        case "ARRIBA", "A":
+            if avatarOffset.height >= -5 {
+                avatarVelocityY = -9.5
+            }
+        case "B", "R1", "R2":
+            // Dash
+            let dashDelta: CGFloat = facingRight ? 65 : -65
+            withAnimation(.easeOut(duration: 0.15)) {
+                avatarOffset.width = min(190, max(-190, avatarOffset.width + dashDelta))
+            }
+        case "X", "L1":
+            // Nail Slash Attack
+            isSlashing = true
+            let attackReach = avatarOffset.width + (facingRight ? 42 : -42)
+            if abs(attackReach - targetDummyOffset) < 48 && abs(avatarOffset.height) < 45 {
+                hitCounter += 1
+                soulCharge = min(1.0, soulCharge + 0.12)
+                dummyHitFlash = true
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                    dummyHitFlash = false
+                    withAnimation(.spring()) {
+                        targetDummyOffset = CGFloat.random(in: -140...140)
                     }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 6)
-                    .background(Color.black.opacity(0.72))
-                    .cornerRadius(8)
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 8)
-                            .stroke(Color.cyan.opacity(0.35), lineWidth: 1)
-                    )
                 }
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
+                isSlashing = false
+            }
+        case "Y", "L2":
+            // Soul Focus / Burst
+            isFocusingSoul = true
+            soulCharge = min(1.0, soulCharge + 0.2)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                isFocusingSoul = false
+            }
+        case "DPAD", "STICK":
+            let dx = controllerManager.moveVector.width
+            if abs(dx) > 0.1 {
+                facingRight = dx > 0
+                avatarOffset.width = min(190, max(-190, avatarOffset.width + dx * 12))
+            }
+        default:
+            break
+        }
+    }
+    
+    private func updatePhysicsTick() {
+        if avatarOffset.height < 0 || avatarVelocityY < 0 {
+            avatarOffset.height += avatarVelocityY
+            avatarVelocityY += 0.55 // Gravity
+            if avatarOffset.height >= 0 {
+                avatarOffset.height = 0
+                avatarVelocityY = 0
             }
         }
     }
@@ -227,7 +432,7 @@ struct GameSessionView: View {
                 Button(action: {
                     withAnimation { showBootConsole = false }
                 }) {
-                    Text(isBootSequenceFinished ? "Cerrar Consola" : "Minimizar")
+                    Text("Ocultar Consola")
                         .font(.system(size: 11, weight: .bold))
                         .foregroundColor(.cyan)
                 }
@@ -250,10 +455,12 @@ struct GameSessionView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 .onChange(of: bootLogs.count) { count in
-                    proxy.scrollTo(count - 1, anchor: .bottom)
+                    if count > 0 {
+                        proxy.scrollTo(count - 1, anchor: .bottom)
+                    }
                 }
             }
-            .frame(height: 140)
+            .frame(height: 120)
         }
         .padding(14)
         .background(Color.black.opacity(0.88))
@@ -262,7 +469,7 @@ struct GameSessionView: View {
             RoundedRectangle(cornerRadius: 12)
                 .stroke(Color.white.opacity(0.25), lineWidth: 1)
         )
-        .frame(maxWidth: 520)
+        .frame(maxWidth: 500)
         .padding(.horizontal, 24)
     }
     
@@ -409,7 +616,7 @@ struct GameSessionView: View {
             
             DispatchQueue.main.async {
                 self.perfManager.isJITEnabled = jitAvailable
-                self.bootLogs.append("[JIT] Dynamic code generation: \(jitAvailable ? "GRANTED (Active JIT)" : "RESTRICTED (Interpreter)")")
+                self.bootLogs.append("[JIT] Dynamic code generation: \(jitAvailable ? "GRANTED (Active JIT)" : "STANDARD (Interpreter)")")
             }
             
             _ = BramaCore.shared().launchExecutable(
@@ -428,15 +635,13 @@ struct GameSessionView: View {
             DispatchQueue.main.async {
                 self.loadedPEInfo = peInfo
                 self.runtimeStatus = rtStatus
+                self.isBootSequenceFinished = true
             }
             
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.8) {
-                self.bootLogs.append("[BRAMA] Render loop successfully attached. Handheld controls ready.")
-                self.isBootSequenceFinished = true
-                DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
-                    withAnimation {
-                        self.showBootConsole = false
-                    }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) {
+                self.bootLogs.append("[BRAMA] Render loop attached. Interactive controls ready.")
+                withAnimation(.easeInOut(duration: 0.35)) {
+                    self.showBootConsole = false
                 }
             }
         }

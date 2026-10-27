@@ -15,14 +15,24 @@ final class ControllerManager: ObservableObject {
     @Published var isPhysicalControllerConnected: Bool = false
     @Published var controllerName: String = "Sin mando físico"
     @Published var controllerBatteryLevel: Float = 1.0
-    @Published var showVirtualTouchControls: Bool = false
+    @Published var showVirtualTouchControls: Bool = true
     
-    // Quick controller actions
-    @Published var lastButtonPressed: String = ""
+    // Real-time input state for in-game session
+    @Published var lastButtonPressed: String = "LISTO"
+    @Published var moveVector: CGSize = .zero
+    @Published var actionPulseID: Int = 0
     
     init() {
         setupControllerObservers()
         checkExistingControllers()
+    }
+    
+    func sendVirtualInput(_ label: String, dx: CGFloat = 0, dy: CGFloat = 0) {
+        lastButtonPressed = label
+        if dx != 0 || dy != 0 {
+            moveVector = CGSize(width: dx, height: dy)
+        }
+        actionPulseID &+= 1
     }
     
     private func setupControllerObservers() {
@@ -58,6 +68,7 @@ final class ControllerManager: ObservableObject {
         DispatchQueue.main.async {
             self.isPhysicalControllerConnected = false
             self.controllerName = "Sin mando físico"
+            self.showVirtualTouchControls = true
         }
     }
     
@@ -68,26 +79,39 @@ final class ControllerManager: ObservableObject {
             self.controllerBatteryLevel = battery.batteryLevel
         }
         
-        // Listen to button presses
         if let extendedGamepad = controller.extendedGamepad {
             extendedGamepad.buttonA.pressedChangedHandler = { [weak self] _, _, pressed in
                 if pressed {
-                    DispatchQueue.main.async { self?.lastButtonPressed = "A" }
+                    DispatchQueue.main.async { self?.sendVirtualInput("A") }
                 }
             }
             extendedGamepad.buttonB.pressedChangedHandler = { [weak self] _, _, pressed in
                 if pressed {
-                    DispatchQueue.main.async { self?.lastButtonPressed = "B" }
+                    DispatchQueue.main.async { self?.sendVirtualInput("B") }
                 }
             }
             extendedGamepad.buttonX.pressedChangedHandler = { [weak self] _, _, pressed in
                 if pressed {
-                    DispatchQueue.main.async { self?.lastButtonPressed = "X" }
+                    DispatchQueue.main.async { self?.sendVirtualInput("X") }
                 }
             }
             extendedGamepad.buttonY.pressedChangedHandler = { [weak self] _, _, pressed in
                 if pressed {
-                    DispatchQueue.main.async { self?.lastButtonPressed = "Y" }
+                    DispatchQueue.main.async { self?.sendVirtualInput("Y") }
+                }
+            }
+            extendedGamepad.dpad.valueChangedHandler = { [weak self] _, xValue, yValue in
+                DispatchQueue.main.async {
+                    if abs(xValue) > 0.2 || abs(yValue) > 0.2 {
+                        self?.sendVirtualInput("DPAD", dx: CGFloat(xValue), dy: CGFloat(-yValue))
+                    }
+                }
+            }
+            extendedGamepad.leftThumbstick.valueChangedHandler = { [weak self] _, xValue, yValue in
+                DispatchQueue.main.async {
+                    if abs(xValue) > 0.2 || abs(yValue) > 0.2 {
+                        self?.sendVirtualInput("STICK", dx: CGFloat(xValue), dy: CGFloat(-yValue))
+                    }
                 }
             }
         }

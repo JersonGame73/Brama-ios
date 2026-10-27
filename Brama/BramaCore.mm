@@ -6,6 +6,7 @@
 //
 
 #import "BramaCore.h"
+#include <TargetConditionals.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -293,18 +294,32 @@ struct BramaImageBaseRelocation {
 // ============================================================================
 
 - (BOOL)isJITAvailable {
-#if defined(__arm64__) || defined(__aarch64__)
+#if TARGET_OS_SIMULATOR
+    return YES;
+#elif defined(__arm64__) || defined(__aarch64__)
     size_t pageSize = getpagesize();
     
-    // On iOS/iPadOS Apple Silicon, allocating JIT memory requires MAP_JIT
-    void *ptr = mmap(NULL, pageSize, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_ANON | MAP_PRIVATE | MAP_JIT, -1, 0);
+    // On iOS/iPadOS, safe JIT verification allocates RW first and tests transitioning to RX via mprotect.
+    // This never triggers EXC_BAD_ACCESS even when running without a debugger or without dynamic-codesigning.
+    void *ptr = mmap(NULL, pageSize, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
     if (ptr == MAP_FAILED) {
-        NSLog(@"[BRAMA-CORE] JIT check: MAP_JIT not permitted by kernel (errno: %d - %s)", errno, strerror(errno));
         return NO;
     }
     
+    // Write a single ARM64 'ret' instruction (0xD65F03C0) while page is RW
+    *reinterpret_cast<uint32_t *>(ptr) = 0xD65F03C0;
+    
+    // Attempt to mark page executable (PROT_READ | PROT_EXEC)
+    int res = mprotect(ptr, pageSize, PROT_READ | PROT_EXEC);
     munmap(ptr, pageSize);
-    return YES;
+    
+    if (res == 0) {
+        NSLog(@"[BRAMA-CORE] JIT check: W^X mprotect(PROT_EXEC) permitted by iOS kernel!");
+        return YES;
+    } else {
+        NSLog(@"[BRAMA-CORE] JIT check: Standard sandboxed mode (Interpreter fallback active).");
+        return NO;
+    }
 #else
     return YES;
 #endif
@@ -1075,30 +1090,23 @@ struct BramaImageBaseRelocation {
         }
     }
     
-#if defined(__arm64__) || defined(__aarch64__)
+#if (defined(__arm64__) || defined(__aarch64__)) && !TARGET_OS_SIMULATOR
     if (jitEnabled) {
         size_t pageSize = getpagesize();
-        if (!_jitCodeCache) {
-            _jitCodeCacheSize = pageSize;
-            _jitCodeCache = mmap(NULL, _jitCodeCacheSize,
-                                 PROT_READ | PROT_WRITE | PROT_EXEC,
-                                 MAP_ANON | MAP_PRIVATE | MAP_JIT,
-                                 -1, 0);
-            if (_jitCodeCache == MAP_FAILED) {
-                _jitCodeCache = NULL;
-            }
+        if (_jitCodeCache && _jitCodeCacheSize > 0) {
+            munmap(_jitCodeCache, _jitCodeCacheSize);
+            _jitCodeCache = NULL;
+        }
+        _jitCodeCacheSize = pageSize;
+        _jitCodeCache = mmap(NULL, _jitCodeCacheSize,
+                             PROT_READ | PROT_WRITE,
+                             MAP_ANON | MAP_PRIVATE,
+                             -1, 0);
+        if (_jitCodeCache == MAP_FAILED) {
+            _jitCodeCache = NULL;
         }
         
         if (_jitCodeCache) {
-            // Resolve Apple Silicon W^X thread toggle dynamically (marked unavailable in iOS headers, active under JIT/TrollStore)
-            using PthreadJITWriteProtectFn = void (*)(int);
-            PthreadJITWriteProtectFn jitWriteProtect = reinterpret_cast<PthreadJITWriteProtectFn>(
-                dlsym(RTLD_DEFAULT, "pthread_jit_write_protect_np"));
-            
-            if (jitWriteProtect) {
-                jitWriteProtect(0);
-            }
-            
             uint32_t *arm64Inst = static_cast<uint32_t *>(_jitCodeCache);
             uint16_t low16  = static_cast<uint16_t>(immValue & 0xFFFF);
             uint16_t high16 = static_cast<uint16_t>((immValue >> 16) & 0xFFFF);
@@ -1111,21 +1119,18 @@ struct BramaImageBaseRelocation {
             arm64Inst[1] = 0x72A00000 | (static_cast<uint32_t>(high16) << 5);
             arm64Inst[2] = 0xD65F03C0; // ret
             
-            // Flush instruction cache on Apple Silicon
-            sys_icache_invalidate(_jitCodeCache, 16);
-            
-            // Switch Apple Silicon W^X thread protection to Execute mode
-            if (jitWriteProtect) {
-                jitWriteProtect(1);
+            // Transition page from RW to RX safely on iOS/iPadOS
+            if (mprotect(_jitCodeCache, _jitCodeCacheSize, PROT_READ | PROT_EXEC) == 0) {
+                sys_icache_invalidate(_jitCodeCache, 16);
+                
+                using JITEntryFn = uint32_t (*)(void);
+                JITEntryFn fn = reinterpret_cast<JITEntryFn>(_jitCodeCache);
+                uint32_t result = fn();
+                
+                emitLog([NSString stringWithFormat:@"[JIT] Translated x86_64 EntryPoint (0x%08X) -> ARM64 Native Code (Result: 0x%08X)",
+                         peInfo.entryPointRVA, result]);
+                return YES;
             }
-            
-            using JITEntryFn = uint32_t (*)(void);
-            JITEntryFn fn = reinterpret_cast<JITEntryFn>(_jitCodeCache);
-            uint32_t result = fn();
-            
-            emitLog([NSString stringWithFormat:@"[JIT] Translated x86_64 EntryPoint (0x%08X) -> ARM64 MAP_JIT cache (Result: 0x%08X)",
-                     peInfo.entryPointRVA, result]);
-            return YES;
         }
     }
 #endif

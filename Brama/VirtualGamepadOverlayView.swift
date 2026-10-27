@@ -17,16 +17,24 @@ struct VirtualGamepadOverlayView: View {
             VStack {
                 HStack {
                     HStack(spacing: 8) {
-                        BumperButton(label: "L2")
-                        BumperButton(label: "L1")
+                        BumperButton(label: "L2") {
+                            controllerManager.sendVirtualInput("L2")
+                        }
+                        BumperButton(label: "L1") {
+                            controllerManager.sendVirtualInput("L1")
+                        }
                     }
                     .padding(.leading, 24)
                     
                     Spacer()
                     
                     HStack(spacing: 8) {
-                        BumperButton(label: "R1")
-                        BumperButton(label: "R2")
+                        BumperButton(label: "R1") {
+                            controllerManager.sendVirtualInput("R1")
+                        }
+                        BumperButton(label: "R2") {
+                            controllerManager.sendVirtualInput("R2")
+                        }
                     }
                     .padding(.trailing, 24)
                 }
@@ -90,12 +98,20 @@ struct VirtualGamepadOverlayView: View {
                 Spacer()
                 HStack {
                     VStack(spacing: 4) {
-                        DPadButton(direction: "chevron.up")
-                        HStack(spacing: 24) {
-                            DPadButton(direction: "chevron.left")
-                            DPadButton(direction: "chevron.right")
+                        DPadButton(direction: "chevron.up") {
+                            controllerManager.sendVirtualInput("ARRIBA", dx: 0, dy: -1)
                         }
-                        DPadButton(direction: "chevron.down")
+                        HStack(spacing: 24) {
+                            DPadButton(direction: "chevron.left") {
+                                controllerManager.sendVirtualInput("IZQUIERDA", dx: -1, dy: 0)
+                            }
+                            DPadButton(direction: "chevron.right") {
+                                controllerManager.sendVirtualInput("DERECHA", dx: 1, dy: 0)
+                            }
+                        }
+                        DPadButton(direction: "chevron.down") {
+                            controllerManager.sendVirtualInput("ABAJO", dx: 0, dy: 1)
+                        }
                     }
                     .padding(.leading, 32)
                     .padding(.bottom, 60)
@@ -104,12 +120,20 @@ struct VirtualGamepadOverlayView: View {
                     
                     // Right Side: Action Buttons (A, B, X, Y)
                     VStack(spacing: 6) {
-                        ActionButton(label: "Y", color: .yellow)
-                        HStack(spacing: 28) {
-                            ActionButton(label: "X", color: .blue)
-                            ActionButton(label: "B", color: .red)
+                        ActionButton(label: "Y", color: .yellow) {
+                            controllerManager.sendVirtualInput("Y")
                         }
-                        ActionButton(label: "A", color: .green)
+                        HStack(spacing: 28) {
+                            ActionButton(label: "X", color: .blue) {
+                                controllerManager.sendVirtualInput("X")
+                            }
+                            ActionButton(label: "B", color: .red) {
+                                controllerManager.sendVirtualInput("B")
+                            }
+                        }
+                        ActionButton(label: "A", color: .green) {
+                            controllerManager.sendVirtualInput("A")
+                        }
                     }
                     .padding(.trailing, 32)
                     .padding(.bottom, 60)
@@ -122,18 +146,19 @@ struct VirtualGamepadOverlayView: View {
 
 fileprivate struct BumperButton: View {
     let label: String
+    let action: () -> Void
     
     var body: some View {
-        Button(action: {}) {
+        Button(action: action) {
             Text(label)
                 .font(.system(size: 13, weight: .bold))
-                .foregroundColor(.white.opacity(0.85))
-                .frame(width: 50, height: 28)
+                .foregroundColor(.white.opacity(0.9))
+                .frame(width: 52, height: 30)
                 .background(Color.white.opacity(0.18))
                 .cornerRadius(6)
                 .overlay(
                     RoundedRectangle(cornerRadius: 6)
-                        .stroke(Color.white.opacity(0.3), lineWidth: 1)
+                        .stroke(Color.white.opacity(0.35), lineWidth: 1)
                 )
         }
     }
@@ -141,18 +166,19 @@ fileprivate struct BumperButton: View {
 
 fileprivate struct DPadButton: View {
     let direction: String
+    let action: () -> Void
     
     var body: some View {
-        Button(action: {}) {
+        Button(action: action) {
             Image(systemName: direction)
                 .font(.system(size: 14, weight: .bold))
-                .foregroundColor(.white.opacity(0.85))
-                .frame(width: 40, height: 40)
-                .background(Color.white.opacity(0.2))
+                .foregroundColor(.white.opacity(0.9))
+                .frame(width: 44, height: 44)
+                .background(Color.white.opacity(0.22))
                 .cornerRadius(8)
                 .overlay(
                     RoundedRectangle(cornerRadius: 8)
-                        .stroke(Color.white.opacity(0.3), lineWidth: 1)
+                        .stroke(Color.white.opacity(0.35), lineWidth: 1)
                 )
         }
     }
@@ -161,18 +187,19 @@ fileprivate struct DPadButton: View {
 fileprivate struct ActionButton: View {
     let label: String
     let color: Color
+    let action: () -> Void
     
     var body: some View {
-        Button(action: {}) {
+        Button(action: action) {
             Text(label)
                 .font(.system(size: 16, weight: .heavy, design: .rounded))
                 .foregroundColor(color)
-                .frame(width: 44, height: 44)
-                .background(Color.white.opacity(0.2))
+                .frame(width: 46, height: 46)
+                .background(Color.white.opacity(0.22))
                 .clipShape(Circle())
                 .overlay(
                     Circle()
-                        .stroke(color.opacity(0.8), lineWidth: 1.5)
+                        .stroke(color.opacity(0.85), lineWidth: 1.8)
                 )
         }
     }
