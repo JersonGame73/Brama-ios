@@ -40,10 +40,11 @@ struct MetalViewportView: UIViewRepresentable {
         
         init(_ parent: MetalViewportView) {
             self.parent = parent
-            if let device = MTLCreateSystemDefaultDevice() {
-                self.commandQueue = device.makeCommandQueue()
-            }
+            let device = MTLCreateSystemDefaultDevice()
+            let queue = device?.makeCommandQueue()
+            self.commandQueue = queue
             super.init()
+            BramaCore.shared().attachMetalDevice(device, commandQueue: queue)
         }
         
         func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {

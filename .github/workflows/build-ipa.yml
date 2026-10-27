@@ -1,0 +1,86 @@
+name: Build & Release Brama IPA (iOS / iPadOS)
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-ipa:
+    name: Build Unsigned IPA (ARM64 Apple Silicon)
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout Brama Repository
+        uses: actions/checkout@v4
+
+      - name: Show Xcode Environment
+        run: |
+          xcodebuild -version
+          xcodebuild -showsdks
+
+      - name: Compile Brama (Release - iphoneos ARM64)
+        run: |
+          xcodebuild clean build \
+            -project Brama.xcodeproj \
+            -scheme Brama \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            ARCHS="arm64" \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Embed Sideloading & JIT Entitlements (AltStore / SideStore / TrollStore)
+        run: |
+          APP_PATH="build/Build/Products/Release-iphoneos/Brama.app"
+          if [ ! -d "$APP_PATH" ]; then
+            echo "Error: Brama.app not found at $APP_PATH"
+            exit 1
+          fi
+
+          # Remove any residual _CodeSignature before applying ad-hoc entitlements
+          rm -rf "$APP_PATH/_CodeSignature"
+
+          # Ad-hoc sign with Brama.entitlements so TrollStore / SideStore / AltStore preserve JIT & Extended Virtual Addressing flags
+          codesign --force --sign - --entitlements Brama/Brama.entitlements --timestamp=none "$APP_PATH"
+          codesign -d --entitlements - "$APP_PATH" || true
+
+      - name: Package Brama.ipa Installer
+        run: |
+          mkdir -p Payload
+          cp -r build/Build/Products/Release-iphoneos/Brama.app Payload/
+          zip -r9 Brama-iOS-ARM64.ipa Payload
+          rm -rf Payload
+          ls -lh Brama-iOS-ARM64.ipa
+
+      - name: Upload Brama-iOS-ARM64.ipa Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Brama-iOS-ARM64-IPA
+          path: Brama-iOS-ARM64.ipa
+          if-no-files-found: error
+
+      - name: Publish IPA to GitHub Releases (on Tag v*)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: Brama-iOS-ARM64.ipa
+          generate_release_notes: true
+          body: |
+            ## 🎮 Brama for iOS & iPadOS (Apple Silicon ARM64)
+            
+            ### 📦 Installation Instructions (Sideloading)
+            - **SideStore / AltStore**: Import `Brama-iOS-ARM64.ipa` into SideStore or AltStore and enable **JIT** from the context menu before launching a game.
+            - **TrollStore**: Open `Brama-iOS-ARM64.ipa` in TrollStore. `dynamic-codesigning` and `extended-virtual-addressing` entitlements are pre-embedded in the binary.

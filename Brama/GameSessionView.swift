@@ -20,6 +20,8 @@ struct GameSessionView: View {
     @State private var showInGameMenu: Bool = false
     @State private var showBootConsole: Bool = true
     @State private var frameCounter: Int = 0
+    @State private var loadedPEInfo: BramaPEExecutableInfo? = nil
+    @State private var runtimeStatus: BramaRuntimeModulesStatus? = nil
     
     private let renderTimer = Timer.publish(every: 1.0 / 60.0, on: .main, in: .common).autoconnect()
     
@@ -127,6 +129,9 @@ struct GameSessionView: View {
         .onAppear {
             startBootSequence()
         }
+        .onDisappear {
+            BramaCore.shared().terminateActiveProcess()
+        }
         .onReceive(renderTimer) { _ in
             frameCounter += 1
         }
@@ -160,8 +165,8 @@ struct GameSessionView: View {
                 )
                 .padding(24)
             
-            // In-Game Center Title & Render Status
-            VStack(spacing: 8) {
+            // In-Game Center Title & Render Status + PE32+ Telemetry Badge
+            VStack(spacing: 10) {
                 Text(game.title)
                     .font(.system(size: 32, weight: .heavy, design: .rounded))
                     .foregroundColor(.white)
@@ -179,6 +184,29 @@ struct GameSessionView: View {
                 .padding(.vertical, 5)
                 .background(Color.black.opacity(0.65))
                 .cornerRadius(12)
+                
+                if let pe = loadedPEInfo {
+                    VStack(spacing: 4) {
+                        Text(String(format: "PE32+ MAPPED @ 0x%llX • ENTRY RVA 0x%04X • %@",
+                                    pe.mappedBaseAddress, pe.entryPointRVA, pe.architectureName))
+                            .font(.system(size: 10, weight: .bold, design: .monospaced))
+                            .foregroundColor(.cyan)
+                        
+                        if !pe.importedDLLs.isEmpty {
+                            Text("DLLs: \(pe.importedDLLs.joined(separator: " • "))")
+                                .font(.system(size: 10, weight: .medium, design: .monospaced))
+                                .foregroundColor(.white.opacity(0.75))
+                        }
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(Color.black.opacity(0.72))
+                    .cornerRadius(8)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8)
+                            .stroke(Color.cyan.opacity(0.35), lineWidth: 1)
+                    )
+                }
             }
         }
     }
@@ -392,6 +420,14 @@ struct GameSessionView: View {
                 DispatchQueue.main.async {
                     self.bootLogs.append(log)
                 }
+            }
+            
+            let peInfo = BramaCore.shared().lastLoadedExecutable
+            let rtStatus = BramaCore.shared().runtimeStatus
+            
+            DispatchQueue.main.async {
+                self.loadedPEInfo = peInfo
+                self.runtimeStatus = rtStatus
             }
             
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.8) {

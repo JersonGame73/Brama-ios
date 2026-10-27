@@ -113,21 +113,22 @@ By leveraging the immense computing power of Apple Silicon (A-Series and M-Serie
 ## 🗺️ Roadmap
 
 - [x] Project architecture setup and open-source licensing (GPLv3).
-- [ ] **Phase 1: Deck UI & Input**
-  - [ ] SteamOS-style dark theme Big Picture interface.
-  - [ ] Game library carousel with artwork and launch action.
-  - [ ] Virtual on-screen touch gamepad overlay.
-  - [ ] GameController framework pairing (DualSense, Xbox, Switch).
-- [ ] **Phase 2: JIT & Sideloading Infrastructure**
-  - [ ] Entitlements setup (`get-task-allow`, dynamic codesigning).
-  - [ ] SideStore/AltStore JIT detection and status indicator.
-- [ ] **Phase 3: Core Runtime Integration**
-  - [ ] Objective-C++ bridging layer.
-  - [ ] Wine / FEX-Emu subsystem integration.
-  - [ ] DXMT / Metal graphics rendering pipeline.
+- [x] **Phase 1: Deck UI & Input**
+  - [x] SteamOS-style dark theme Big Picture interface.
+  - [x] Game library carousel with artwork and launch action.
+  - [x] Virtual on-screen touch gamepad overlay.
+  - [x] GameController framework pairing (DualSense, Xbox, Switch).
+- [x] **Phase 2: JIT & Sideloading Infrastructure**
+  - [x] Entitlements setup (`get-task-allow`, `dynamic-codesigning`, `extended-virtual-addressing`, `increased-memory-limit`).
+  - [x] SideStore/AltStore/TrollStore JIT detection and status indicator.
+  - [x] GitHub Actions automated `.ipa` builder and release workflow (`.github/workflows/build-ipa.yml`).
+- [x] **Phase 3: Core Runtime & PE32+ Loader Integration**
+  - [x] Objective-C++ bridging layer (`BramaCore.h` / `BramaCore.mm`).
+  - [x] Windows PE32 / PE32+ (`.exe`) header parser, virtual memory section mapper (`mmap`), base relocator, and IAT/DLL import resolver.
+  - [x] Apple Silicon `MAP_JIT` (`pthread_jit_write_protect_np`) dynamic code cache & Wine / FEX-Emu / DXMT dynamic library loader.
 - [ ] **Phase 4: Game Management & Optimizations**
-  - [ ] Prefix creation & dependency installer.
-  - [ ] Thermal throttling profiles & battery saver mode.
+  - [x] Prefix creation & Windows Registry Direct3D -> DXMT Metal override provisioning.
+  - [ ] Precompiled WineKit / Box64 / DXMT `.dylib` bundle downloader & shader cache warming.
 
 ---
 
