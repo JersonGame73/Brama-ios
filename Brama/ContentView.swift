@@ -139,10 +139,16 @@ struct ContentView: View {
     private var topNavigationBar: some View {
         HStack(spacing: 16) {
             // Brama Brand
-            HStack(spacing: 6) {
-                Image(systemName: "gamecontroller.fill")
-                    .font(.system(size: 18, weight: .bold))
-                    .foregroundColor(Color(red: 0.1, green: 0.62, blue: 1.0))
+            HStack(spacing: 8) {
+                Image("BramaLogo")
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 26, height: 26)
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 6)
+                            .stroke(Color(red: 0.1, green: 0.62, blue: 1.0).opacity(0.6), lineWidth: 1)
+                    )
                 
                 Text("BRAMA")
                     .font(.system(size: 16, weight: .black, design: .rounded))

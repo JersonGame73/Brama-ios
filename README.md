@@ -2,6 +2,10 @@
 
 <div align="center">
 
+<img src="Brama/Assets.xcassets/AppIcon.appiconset/AppIcon.png" alt="Brama Official Logo" width="160" style="border-radius: 32px;" />
+
+<br /><br />
+
 [![Platform](https://img.shields.io/badge/Platform-iOS%20%7C%20iPadOS-000000.svg?style=for-the-badge&logo=apple&logoColor=white)](https://apple.com)
 [![Architecture](https://img.shields.io/badge/Architecture-ARM64%20(Apple%20Silicon)-FF9500.svg?style=for-the-badge)](https://apple.com)
 [![Swift](https://img.shields.io/badge/Swift-5.9+-F05138.svg?style=for-the-badge&logo=swift&logoColor=white)](https://swift.org)
