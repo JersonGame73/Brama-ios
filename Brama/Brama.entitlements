@@ -2,47 +2,8 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<!-- Enables debugger attachment required by AltStore, SideStore, StikJIT, and Xcode for JIT activation -->
-	<key>get-task-allow</key>
-	<true/>
-
-	<!-- Enables native RWX / MAP_JIT memory pages in TrollStore and supported sideload environments -->
-	<key>dynamic-codesigning</key>
-	<true/>
-
-	<!-- Grants 64-bit extended virtual address space required by Wine and PE32+ (x86_64) executables -->
-	<key>com.apple.developer.kernel.extended-virtual-addressing</key>
-	<true/>
-
-	<!-- Raises the iOS/iPadOS Jetsam physical RAM limit for AAA PC games on Apple Silicon -->
-	<key>com.apple.developer.kernel.increased-memory-limit</key>
-	<true/>
-
-	<!-- Allows JIT compilation and unsigned executable memory blocks -->
-	<key>com.apple.security.cs.allow-jit</key>
-	<true/>
-	<key>com.apple.security.cs.allow-unsigned-executable-memory</key>
-	<true/>
-
-	<!-- Allows loading external/unsigned .dylib modules (Wine, Box64, FEX-Emu, DXMT, MoltenVK) -->
-	<key>com.apple.security.cs.disable-library-validation</key>
-	<true/>
-
-	<!-- Hardware Game Controller support (DualSense, Xbox Wireless, Switch Pro, MFi) -->
-	<key>com.apple.developer.game-controller</key>
-	<array>
-		<dict>
-			<key>ProfileName</key>
-			<string>ExtendedGamepad</string>
-		</dict>
-		<dict>
-			<key>ProfileName</key>
-			<string>DirectionalGamepad</string>
-		</dict>
-		<dict>
-			<key>ProfileName</key>
-			<string>MicroGamepad</string>
-		</dict>
-	</array>
+	<!-- Clean entitlements file for Personal Development Team signing in Xcode.
+	     Xcode automatically injects get-task-allow=true for Debug/JIT on your iPad.
+	     Full sideload/TrollStore entitlements are in .github/Brama-Sideload.entitlements -->
 </dict>
 </plist>

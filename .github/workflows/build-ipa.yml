@@ -53,8 +53,8 @@ jobs:
           # Remove any residual _CodeSignature before applying ad-hoc entitlements
           rm -rf "$APP_PATH/_CodeSignature"
 
-          # Ad-hoc sign with Brama.entitlements so TrollStore / SideStore / AltStore preserve JIT & Extended Virtual Addressing flags
-          codesign --force --sign - --entitlements Brama/Brama.entitlements --timestamp=none "$APP_PATH"
+          # Ad-hoc sign with Brama-Sideload.entitlements so TrollStore / SideStore / AltStore preserve JIT & Extended Virtual Addressing flags
+          codesign --force --sign - --entitlements .github/Brama-Sideload.entitlements --timestamp=none "$APP_PATH"
           codesign -d --entitlements - "$APP_PATH" || true
 
       - name: Package Brama.ipa Installer
