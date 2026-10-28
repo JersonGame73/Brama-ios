@@ -4,24 +4,5 @@
    type = "1"
    version = "2.0">
    <Breakpoints>
-      <BreakpointProxy
-         BreakpointExtensionID = "Xcode.Breakpoint.SymbolicBreakpoint">
-         <BreakpointContent
-            uuid = "C9B2E3F1-6A5D-4C3B-8E2D-2F3A4B5C6D7E"
-            shouldBeEnabled = "Yes"
-            ignoreCount = "0"
-            continueAfterRunningActions = "Yes"
-            symbolName = "jit26_prepare_region"
-            moduleName = "libmadeira.dylib">
-            <Actions>
-               <BreakpointActionProxy
-                  ActionExtensionID = "Xcode.BreakpointAction.DebuggerCommand">
-                  <ActionContent
-                     consoleCommand = "command script import &quot;/Users/jersongame73/Library/Mobile Documents/com~apple~CloudDocs/Documents/Project/Brama/scripts/xcode_jit_bridge.py&quot;">
-                  </ActionContent>
-               </BreakpointActionProxy>
-            </Actions>
-         </BreakpointContent>
-      </BreakpointProxy>
    </Breakpoints>
 </Bucket>
