@@ -46,13 +46,17 @@ final class GameStorageManager: ObservableObject {
            let data = try? Data(contentsOf: fileURL),
            var decoded = try? JSONDecoder().decode([GameTitle].self, from: data),
            !decoded.isEmpty {
-            // Sanitize legacy SF Symbol names saved in older JSON
+            // Sanitize legacy SF Symbol names & executable paths without .exe extension
             for i in 0..<decoded.count {
                 if decoded[i].systemIcon == "radiation" {
                     decoded[i].systemIcon = "atom"
                 }
+                if !decoded[i].executablePath.lowercased().hasSuffix(".exe") {
+                    decoded[i].executablePath += ".exe"
+                }
             }
             self.games = decoded
+            saveGames()
         } else {
             self.games = GameTitle.samples
             saveGames()
@@ -94,19 +98,25 @@ final class GameStorageManager: ObservableObject {
             }
             try? fileManager.copyItem(at: executableURL, to: targetGameFolder)
             
-            // Automatically find the primary .exe inside the copied game folder
-            if let items = try? fileManager.contentsOfDirectory(atPath: targetGameFolder.path) {
-                let exeFiles = items.filter { item in
-                    let lower = item.lowercased()
-                    return lower.hasSuffix(".exe")
+            // Automatically find the primary .exe inside the copied game folder (including nested subfolders)
+            if let enumerator = fileManager.enumerator(atPath: targetGameFolder.path) {
+                var foundExes: [String] = []
+                while let relPath = enumerator.nextObject() as? String {
+                    let lower = relPath.lowercased()
+                    if lower.hasSuffix(".exe")
                         && !lower.contains("crashhandler")
                         && !lower.contains("unins")
                         && !lower.contains("redist")
-                        && !lower.contains("setup")
+                        && !lower.contains("setup") {
+                        foundExes.append(relPath)
+                    }
                 }
-                if let primaryExe = exeFiles.first {
+                if let primaryExe = foundExes.first {
                     detectedExeName = primaryExe
                 }
+            }
+            if !detectedExeName.lowercased().hasSuffix(".exe") {
+                detectedExeName += ".exe"
             }
         } else {
             // User selected a single .exe file: also try to copy sibling DLLs / Data if accessible in parent directory

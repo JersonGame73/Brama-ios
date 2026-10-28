@@ -1029,22 +1029,25 @@ typedef uint64_t (*BramaDXMTPresentFrameFn)(uint64_t frameIndex, float *outClear
                                 prefixPath:(NSString *)prefixPath {
     NSFileManager *fm = [NSFileManager defaultManager];
     
-    // 1. If executablePath is already a valid absolute POSIX path on iPadOS
-    if ([executablePath hasPrefix:@"/"] && [fm fileExistsAtPath:executablePath]) {
+    // 1. If executablePath is already a valid absolute POSIX file path on iPadOS (not a directory)
+    BOOL isDir = NO;
+    if ([executablePath hasPrefix:@"/"] && [fm fileExistsAtPath:executablePath isDirectory:&isDir] && !isDir) {
         return executablePath;
     }
     
     // 2. Check inside Documents/BramaGames if user imported a file via UIDocumentPicker
     NSArray<NSString *> *docsDirs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
     NSString *docsDir = docsDirs.firstObject ?: NSTemporaryDirectory();
-    NSString *exeName = [[executablePath stringByReplacingOccurrencesOfString:@"\\" withString:@"/"] lastPathComponent];
+    NSString *rawName = [[executablePath stringByReplacingOccurrencesOfString:@"\\" withString:@"/"] lastPathComponent];
+    NSString *exeName = [rawName.lowercaseString hasSuffix:@".exe"] ? rawName : [rawName stringByAppendingPathExtension:@"exe"];
     
     NSString *bramaGamesDir = [docsDir stringByAppendingPathComponent:@"BramaGames"];
     NSDirectoryEnumerator *enumerator = [fm enumeratorAtPath:bramaGamesDir];
     for (NSString *relPath in enumerator) {
         if ([[relPath lastPathComponent] caseInsensitiveCompare:exeName] == NSOrderedSame) {
             NSString *candidate = [bramaGamesDir stringByAppendingPathComponent:relPath];
-            if ([fm fileExistsAtPath:candidate]) {
+            BOOL candIsDir = NO;
+            if ([fm fileExistsAtPath:candidate isDirectory:&candIsDir] && !candIsDir) {
                 return candidate;
             }
         }
@@ -1055,8 +1058,15 @@ typedef uint64_t (*BramaDXMTPresentFrameFn)(uint64_t frameIndex, float *outClear
     if ([normalized hasPrefix:@"C:/"] || [normalized hasPrefix:@"c:/"]) {
         normalized = [normalized substringFromIndex:3];
     }
+    if (![normalized.lowercaseString hasSuffix:@".exe"]) {
+        normalized = [normalized stringByAppendingPathExtension:@"exe"];
+    }
     
     NSString *driveCPath = [[prefixPath stringByAppendingPathComponent:@"drive_c"] stringByAppendingPathComponent:normalized];
+    BOOL driveCIsDir = NO;
+    if ([fm fileExistsAtPath:driveCPath isDirectory:&driveCIsDir] && driveCIsDir) {
+        driveCPath = [driveCPath stringByAppendingPathComponent:exeName];
+    }
     if (![fm fileExistsAtPath:driveCPath]) {
         // Synthesize a valid PE32+ executable at drive_c path so the PE loader can parse & map real headers
         [self ensureValidPE32PlusExecutableAtPath:driveCPath title:[exeName stringByDeletingPathExtension]];
@@ -2279,31 +2289,60 @@ typedef uint64_t (*BramaDXMTPresentFrameFn)(uint64_t frameIndex, float *outClear
         }
     }
 
-    NSString *exeName = [[executablePath stringByReplacingOccurrencesOfString:@"\\" withString:@"/"] lastPathComponent];
+    NSString *rawName = [[executablePath stringByReplacingOccurrencesOfString:@"\\" withString:@"/"] lastPathComponent];
+    NSString *exeName = [rawName.lowercaseString hasSuffix:@".exe"] ? rawName : [rawName stringByAppendingPathExtension:@"exe"];
+    NSString *baseTitle = [exeName stringByDeletingPathExtension];
 
-    // Search inside <winePrefix>/drive_c/Games for a matching .exe
+    // Search inside <winePrefix>/drive_c/Games for a matching non-directory .exe file
+    NSString *fallbackExeRelPath = nil;
     NSDirectoryEnumerator *driveCEnum = [fm enumeratorAtPath:driveCGamesDir];
     for (NSString *relPath in driveCEnum) {
-        if ([[relPath lastPathComponent] caseInsensitiveCompare:exeName] == NSOrderedSame) {
-            NSString *fullUnixPath = [driveCGamesDir stringByAppendingPathComponent:relPath];
-            if ([fm fileExistsAtPath:fullUnixPath]) {
-                NSString *winRel = [relPath stringByReplacingOccurrencesOfString:@"/" withString:@"\\"];
-                NSString *winFull = [NSString stringWithFormat:@"C:\\Games\\%@", winRel];
-                NSString *winDir = [winFull stringByDeletingLastPathComponent];
-                if (![winDir hasPrefix:@"C:\\"]) {
-                    NSRange lastBackslash = [winFull rangeOfString:@"\\" options:NSBackwardsSearch];
-                    winDir = (lastBackslash.location != NSNotFound) ? [winFull substringToIndex:lastBackslash.location] : @"C:\\Games";
-                }
-                if (outWinPath) *outWinPath = winFull;
-                if (outWinWorkDir) *outWinWorkDir = winDir;
-                return fullUnixPath;
+        NSString *fullUnixPath = [driveCGamesDir stringByAppendingPathComponent:relPath];
+        BOOL isDir = NO;
+        if (![fm fileExistsAtPath:fullUnixPath isDirectory:&isDir] || isDir) {
+            continue;
+        }
+        NSString *lastComp = [relPath lastPathComponent];
+        NSString *lowerLast = lastComp.lowercaseString;
+        if (![lowerLast hasSuffix:@".exe"]) {
+            continue;
+        }
+        if ([lastComp caseInsensitiveCompare:exeName] == NSOrderedSame) {
+            NSString *winRel = [relPath stringByReplacingOccurrencesOfString:@"/" withString:@"\\"];
+            NSString *winFull = [NSString stringWithFormat:@"C:\\Games\\%@", winRel];
+            NSRange lastBackslash = [winFull rangeOfString:@"\\" options:NSBackwardsSearch];
+            NSString *winDir = (lastBackslash.location != NSNotFound) ? [winFull substringToIndex:lastBackslash.location] : @"C:\\Games";
+            if (outWinPath) *outWinPath = winFull;
+            if (outWinWorkDir) *outWinWorkDir = winDir;
+            return fullUnixPath;
+        }
+        // Keep track of primary .exe inside the matching game folder in case the .exe filename differs slightly from title
+        if (!fallbackExeRelPath &&
+            ![lowerLast containsString:@"crashhandler"] &&
+            ![lowerLast containsString:@"unins"] &&
+            ![lowerLast containsString:@"redist"] &&
+            ![lowerLast containsString:@"setup"]) {
+            if ([relPath.lowercaseString containsString:baseTitle.lowercaseString]) {
+                fallbackExeRelPath = relPath;
             }
         }
     }
 
+    if (fallbackExeRelPath) {
+        NSString *fullUnixPath = [driveCGamesDir stringByAppendingPathComponent:fallbackExeRelPath];
+        NSString *winRel = [fallbackExeRelPath stringByReplacingOccurrencesOfString:@"/" withString:@"\\"];
+        NSString *winFull = [NSString stringWithFormat:@"C:\\Games\\%@", winRel];
+        NSRange lastBackslash = [winFull rangeOfString:@"\\" options:NSBackwardsSearch];
+        NSString *winDir = (lastBackslash.location != NSNotFound) ? [winFull substringToIndex:lastBackslash.location] : @"C:\\Games";
+        if (outWinPath) *outWinPath = winFull;
+        if (outWinWorkDir) *outWinWorkDir = winDir;
+        return fullUnixPath;
+    }
+
     // Also check if the user imported files flat inside Documents/BramaGames/
     NSString *flatExe = [bramaGamesDir stringByAppendingPathComponent:exeName];
-    if ([fm fileExistsAtPath:flatExe]) {
+    BOOL flatIsDir = NO;
+    if ([fm fileExistsAtPath:flatExe isDirectory:&flatIsDir] && !flatIsDir) {
         NSString *folderName = [exeName stringByDeletingPathExtension];
         NSString *targetGameDir = [driveCGamesDir stringByAppendingPathComponent:folderName];
         [fm createDirectoryAtPath:targetGameDir withIntermediateDirectories:YES attributes:nil error:nil];
